@@ -15,6 +15,9 @@ import logging
 import os
 from datetime import datetime, timezone, timedelta
 from statistics import mean
+import re
+
+sent_live_signals = set()
 
 import httpx
 from telegram import Bot
@@ -448,6 +451,18 @@ def traducir_signal(reason):
         return "El equipo visitante va ganando por 1 gol"
     else:
         return reason
+      def normalize_reason(reason: str) -> str:
+    reason = reason.strip().lower()
+    reason = re.sub(r"at\s+\d{1,3}'?", "", reason)
+    reason = re.sub(r"\s+", " ", reason).strip()
+    return reason
+
+def make_signal_key(alert: dict) -> str:
+    home = alert["home"].strip().lower()
+    away = alert["away"].strip().lower()
+    league = alert["league"].strip().lower()
+    reason = normalize_reason(alert["reason"])
+    return f"{league}|{home}|{away}|{reason}"
 
 def format_live(alert: dict) -> str:
     s          = alert["score"]
@@ -524,13 +539,22 @@ async def run_cycle(bot: Bot, client: httpx.AsyncClient) -> None:
         [f"{a['type']}={a['score']}/10" for a in selected],
     )
 
-    for alert in selected:
-        if alert["type"] == "pre_match":
-            text = format_pre_match(alert)
-        else:
-            text = format_live(alert)
+   for alert in selected:
+    if alert["type"] == "pre_match":
+        text = format_pre_match(alert)
         await send_message(bot, text)
-        await asyncio.sleep(1)  # brief pause between messages
+    else:
+        signal_key = make_signal_key(alert)
+
+        if signal_key in sent_live_signals:
+            print(f"🚫 Señal duplicada omitida: {signal_key}")
+            continue
+
+        text = format_live(alert)
+        await send_message(bot, text)
+        sent_live_signals.add(signal_key)
+
+    await asyncio.sleep(1)  # brief pause between messages 
 
 
 async def main() -> None:
