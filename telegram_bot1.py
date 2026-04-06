@@ -437,14 +437,24 @@ def format_pre_match(alert: dict) -> str:
         f"💵  Stake:       *{suggested_stake(s)}*",
         f"{DIV}",
     ])
-
+def traducir_signal(reason):
+    if "comeback / Draw" in reason:
+        return "Apostar a que el equipo local empata o remonta"
+    elif "Over" in reason:
+        return "Se esperan más goles en el partido"
+    elif "Next goal" in reason:
+        return "Próximo gol del equipo indicado"
+    elif "lead by 1" in reason:
+        return "El equipo visitante va ganando por 1 gol"
+    else:
+        return reason
 
 def format_live(alert: dict) -> str:
     s          = alert["score"]
     home, away = alert["home"], alert["away"]
     sh, sa     = alert["score_str"].split("-")
 
-    header = "💎 *VIP LIVE SIGNAL*" if s >= 8 else "🔴 *LIVE SIGNAL*"
+    header = "💎 *SEÑAL VIP EN VIVO*" if s >= 8 else "🔴 *SEÑAL EN VIVO*"
 
     return "\n".join([
         header,
@@ -454,10 +464,10 @@ def format_live(alert: dict) -> str:
         f"",
         f"*{home}*   {sh} — {sa}   *{away}*",
         f"{DIV}",
-        f"✅  *SIGNAL:*  {alert['reason']}",
+        f"✅ *SEÑAL:* {traducir_signal(alert['reason'])}",
         f"{DIV}",
-        f"🎯  Confidence:  *{s} / 10*",
-        f"💵  Stake:       *{suggested_stake(s)}*",
+        f"🎯 Confianza: *{s} / 10*",
+        f"💵 Apuesta: *{suggested_stake(s)}*",
         f"{DIV}",
     ])
 
