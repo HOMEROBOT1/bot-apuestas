@@ -28,10 +28,10 @@ sent_parley_signals = set()
 # Configuration
 # ---------------------------------------------------------------------------
 
-BOT_TOKEN = ("8713741185:AAFqvoZ0Ji3xWw2FsA8BuMslfCGhQ0tMzCQ", "")
-ODDS_API_KEY = ("6a49cb00636453d9e9f8dc0603021a11", "")
-FOOTBALL_API_KEY = ("c455630d0023ef208f93dd0567164905", "")
-CHAT_ID = ("1983622390", "")
+BOT_TOKEN = "8713741185:AAFqvoZ0Ji3xWw2FsA8BuMslfCGhQ0tMzCQ"
+ODDS_API_KEY = "6a49cb00636453d9e9f8dc0603021a11"
+FOOTBALL_API_KEY = "c455630d0023ef208f93dd0567164905"
+CHAT_ID = "1983622390"
 
 print("DEBUG BOT_TOKEN TYPE:", type(BOT_TOKEN), BOT_TOKEN)
 print("DEBUG ODDS_API_KEY TYPE:", type(ODDS_API_KEY), ODDS_API_KEY)
