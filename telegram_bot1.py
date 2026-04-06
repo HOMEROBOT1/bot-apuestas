@@ -529,14 +529,6 @@ async def main() -> None:
     info   = await bot.get_me()
     logger.info("Bot online: @%s", info.username)
 
-  async def main():
-    bot = Bot(token=BOT_TOKEN)
-
-    await bot.send_message(
-        chat_id=CHAT_ID,
-        text="🚀 PRUEBA: el bot ya está funcionando correctamente"
-    )
-
     # Warn clearly if API keys are missing
     if not ODDS_API_KEY:
         logger.warning(
