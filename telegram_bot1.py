@@ -28,10 +28,10 @@ sent_parley_signals = set()
 # Configuration
 # ---------------------------------------------------------------------------
 
-BOT_TOKEN = os.environ.get("8713741185:AAFqvoZ0Ji3xWw2FsA8BuMslfCGhQ0tMzCQ", "")
-ODDS_API_KEY = os.environ.get("6a49cb00636453d9e9f8dc0603021a11", "")
-FOOTBALL_API_KEY = os.environ.get("c455630d0023ef208f93dd0567164905", "")
-CHAT_ID = os.environ.get("1983622390", "")
+BOT_TOKEN = ("8713741185:AAFqvoZ0Ji3xWw2FsA8BuMslfCGhQ0tMzCQ", "")
+ODDS_API_KEY = ("6a49cb00636453d9e9f8dc0603021a11", "")
+FOOTBALL_API_KEY = ("c455630d0023ef208f93dd0567164905", "")
+CHAT_ID = ("1983622390", "")
 
 # How often to run a full cycle (seconds)
 CYCLE_INTERVAL = 300   # 5 minutes
