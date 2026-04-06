@@ -539,22 +539,22 @@ async def run_cycle(bot: Bot, client: httpx.AsyncClient) -> None:
         [f"{a['type']}={a['score']}/10" for a in selected],
     )
 
-   for alert in selected:
-    if alert["type"] == "pre_match":
-        text = format_pre_match(alert)
-        await send_message(bot, text)
-    else:
-        signal_key = make_signal_key(alert)
+    for alert in selected:
+        if alert["type"] == "pre_match":
+            text = format_pre_match(alert)
+            await send_message(bot, text)
+        else:
+            signal_key = make_signal_key(alert)
 
-        if signal_key in sent_live_signals:
-            print(f"🚫 Señal duplicada omitida: {signal_key}")
-            continue
+            if signal_key in sent_live_signals:
+                print(f"🚫 Señal duplicada omitida: {signal_key}")
+                continue
 
-        text = format_live(alert)
-        await send_message(bot, text)
-        sent_live_signals.add(signal_key)
+            text = format_live(alert)
+            await send_message(bot, text)
+            sent_live_signals.add(signal_key)
 
-    await asyncio.sleep(1)  # brief pause between messages 
+        await asyncio.sleep(1)
 
 
 async def main() -> None:
