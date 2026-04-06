@@ -28,7 +28,7 @@ import os
 
 BOT_TOKEN = "8713741185:AAFqvoZ0Ji3xWw2FsA8BuMslfCGhQ0tMzCQ"
 ODDS_API_KEY = "6a49cb00636453d9e9f8dc0603021a11"
-
+await bot.send_message(chat_id=CHAT_ID, text="🚀 PRUEBA: el bot ya está funcionando correctamente")
 print("TOKEN:", BOT_TOKEN)
 print("ODDS:", ODDS_API_KEY)
 CHAT_ID   = "1983622390"
