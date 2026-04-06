@@ -27,7 +27,10 @@ from telegram.error import TelegramError
 import os
 
 BOT_TOKEN = os.getenv("8713741185:AAFqvoZ0Ji3xWw2FsA8BuMslfCGhQ0tMzCQ")
+ODDS_API_KEY = os.getenv("c455630d0023ef208f93dd0567164905")
+
 print("TOKEN:", BOT_TOKEN)
+print("ODDS:", ODDS_API_KEY)
 CHAT_ID   = "1983622390"
 
 ODDS_API_KEY      = os.environ.get("ODDS_API_KEY", "")      # https://the-odds-api.com
