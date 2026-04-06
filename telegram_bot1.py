@@ -54,10 +54,12 @@ MIN_VALUE_EDGE = 0.06
 # ---------------------------------------------------------------------------
 
 WHITELISTED_SPORTS = {
-    "soccer_epl":                "🏴 Premier League",
+    "soccer_epl": "🇬🇧 Premier League",
     "soccer_uefa_champs_league": "🏆 Champions League",
-    "soccer_mexico_ligamx":      "🇲🇽 Liga MX",
-}
+    "soccer_mexico_ligamx": "🇲🇽 Liga MX",
+} 
+ODDS_MARKETS = "h2h"
+ODDS_REGIONS = "uk"
 
 # API-Football competition IDs for live checks (must mirror WHITELISTED_SPORTS)
 LIVE_LEAGUE_IDS = {
@@ -392,16 +394,16 @@ async def fetch_pre_match_alerts(client: httpx.AsyncClient) -> list[dict]:
     for sport_key, league_name in WHITELISTED_SPORTS.items():
         try:
             r = await client.get(
-                f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/",
-                params={
-                    "apiKey": ODDS_API_KEY,
-                    "regions": "eu",
-                    "markets": "h2h,totals,btts",
-                    "oddsFormat": "decimal",
-                    "dateFormat": "iso",
-                },
-                timeout=10,
-            )
+    f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/",
+    params={
+        "apiKey": ODDS_API_KEY,
+        "regions": ODDS_REGIONS,
+        "markets": ODDS_MARKETS,
+        "oddsFormat": "decimal",
+        "dateFormat": "iso",
+    },
+    timeout=10,
+)
             if r.status_code != 200:
                 logger.warning("Odds API %s → %s", sport_key, r.status_code)
                 continue
