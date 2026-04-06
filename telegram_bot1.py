@@ -26,8 +26,8 @@ from telegram.error import TelegramError
 
 import os
 
-BOT_TOKEN = os.getenv("8713741185:AAFqvoZ0Ji3xWw2FsA8BuMslfCGhQ0tMzCQ")
-ODDS_API_KEY = os.getenv("6a49cb00636453d9e9f8dc0603021a11")
+BOT_TOKEN = "8713741185:AAFqvoZ0Ji3xWw2FsA8BuMslfCGhQ0tMzCQ"
+ODDS_API_KEY = "6a49cb00636453d9e9f8dc0603021a11"
 
 print("TOKEN:", BOT_TOKEN)
 print("ODDS:", ODDS_API_KEY)
