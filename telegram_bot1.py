@@ -451,7 +451,7 @@ def traducir_signal(reason):
         return "El equipo visitante va ganando por 1 gol"
     else:
         return reason
-      def normalize_reason(reason: str) -> str:
+def normalize_reason(reason: str) -> str:
     reason = reason.strip().lower()
     reason = re.sub(r"at\s+\d{1,3}'?", "", reason)
     reason = re.sub(r"\s+", " ", reason).strip()
