@@ -649,24 +649,24 @@ async def fetch_upcoming_matches(client: httpx.AsyncClient) -> list[dict]:
             status = fixture.get("status", {}).get("short")
 
             # Solo partidos que no han empezado
-          if status not in ["NS", "TBD"]:
-              continue
+            if status not in ["NS", "TBD"]:
+                continue
 
-              league_id = league.get("id")
-          if allowed_league_ids and league_id not in allowed_league_ids:
-              continue
+            league_id = league.get("id")
+            if allowed_league_ids and league_id not in allowed_league_ids:
+                continue
   
-              kickoff_str = fixture.get("date")
-          if not kickoff_str:
-              continue
+            kickoff_str = fixture.get("date")
+            if not kickoff_str:
+                continue
   
-              kickoff = datetime.fromisoformat(kickoff_str.replace("Z", "+00:00"))
+            kickoff = datetime.fromisoformat(kickoff_str.replace("Z", "+00:00"))
 
-              home = teams.get("home", {}).get("name")
-              away = teams.get("away", {}).get("name")
+            home = teams.get("home", {}).get("name")
+            away = teams.get("away", {}).get("name")
 
-          if not home or not away:
-              continue
+            if not home or not away:
+                continue
 
               matches.append({
               "match_key": str(fixture.get("id")),
