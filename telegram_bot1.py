@@ -824,6 +824,7 @@ async def main():
     async with httpx.AsyncClient() as client:
         while True:
             try:
+                upcoming_matches = []
                 now_local = datetime.now(ZoneInfo("America/Mexico_City"))
                 hour = now_local.hour
 
