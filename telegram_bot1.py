@@ -678,7 +678,21 @@ async def fetch_upcoming_matches(client: httpx.AsyncClient) -> list[dict]:
         logger.warning("Error obteniendo próximos partidos: %s", exc)
 
     return matches
+  
+def format_pre_match_alert(alert: dict) -> str:
+    local_time = alert["commence_time"].astimezone()
+    hour_text = local_time.strftime("%I:%M %p").lstrip("0")
 
+    return (
+        f"📊 ALERTA PRE-PARTIDO\n\n"
+        f"{alert['home_team']} vs {alert['away_team']}\n"
+        f"Liga: {alert['league']}\n"
+        f"Pick: {alert['pick']}\n"
+        f"Mejor cuota: {alert['best_odds']}\n"
+        f"Cuota promedio: {alert['avg_odds']}\n"
+        f"Edge: {alert['edge']}%\n"
+        f"Hora: {hour_text}"
+    )
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
