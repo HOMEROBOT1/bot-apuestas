@@ -864,8 +864,8 @@ async def main():
                     sleep_seconds = 60
                     logger.info("Hay partidos programados hoy. Revisando en %ds...", sleep_seconds)
                 else:
-                    sleep_seconds = 1800
-                    logger.info("No hay partidos programados. Revisando en %ds...", sleep_seconds)
+                    sleep_seconds = 60
+                    logger.info("No hay partidos próximos. Pero sigo revisando en vivo cada %ds...", sleep_seconds)
 
                 try:
                     live_alerts = await fetch_live_alerts(client)
