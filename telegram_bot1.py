@@ -30,7 +30,7 @@ odds_credits_alert_sent = False
 # ---------------------------------------------------------------------------
 
 BOT_TOKEN = "8713741185:AAFqvoZ0Ji3xWw2FsA8BuMslfCGhQ0tMzCQ"
-ODDS_API_KEY = "6a49cb00636453d9e9f8dc0603021a11"
+ODDS_API_KEY = "92f3a8c48fe9834c7b1e6bbf38346064"
 FOOTBALL_API_KEY = "c455630d0023ef208f93dd0567164905"
 CHAT_ID = "1983622390"
 
