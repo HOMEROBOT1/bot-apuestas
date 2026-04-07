@@ -38,10 +38,10 @@ print("DEBUG ODDS_API_KEY TYPE:", type(ODDS_API_KEY), ODDS_API_KEY)
 print("DEBUG FOOTBALL_API_KEY TYPE:", type(FOOTBALL_API_KEY), FOOTBALL_API_KEY)
 print("DEBUG CHAT_ID TYPE:", type(CHAT_ID), CHAT_ID)
 # How often to run a full cycle (seconds)
-CYCLE_INTERVAL = 300   # 5 minutes
+CYCLE_INTERVAL = 900   # 15 minutes
 
 # How far ahead to look for upcoming matches (hours)
-PRE_MATCH_WINDOW_HOURS = 3
+PRE_MATCH_WINDOW_HOURS = 6
 
 # Maximum alerts to send per cycle
 MAX_ALERTS_PER_CYCLE = 5
@@ -69,7 +69,7 @@ LIVE_LEAGUE_IDS = {
 }
 
 # Delay between consecutive Odds API requests (seconds) to avoid rate limits
-ODDS_API_REQUEST_DELAY = 10
+ODDS_API_REQUEST_DELAY = 60
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -385,7 +385,6 @@ def build_parley_alert(event: dict, league_name: str) -> dict | None:
 # ---------------------------------------------------------------------------
 # Data fetchers
 # ---------------------------------------------------------------------------
-
 async def fetch_pre_match_alerts(client: httpx.AsyncClient) -> list[dict]:
     alerts: list[dict] = []
     now = datetime.now(timezone.utc)
@@ -394,152 +393,110 @@ async def fetch_pre_match_alerts(client: httpx.AsyncClient) -> list[dict]:
     for sport_key, league_name in WHITELISTED_SPORTS.items():
         try:
             r = await client.get(
-    f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/",
-    params={
-        "apiKey": ODDS_API_KEY,
-        "regions": ODDS_REGIONS,
-        "markets": ODDS_MARKETS,
-        "oddsFormat": "decimal",
-        "dateFormat": "iso",
-    },
-    timeout=10,
-)
+                f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/",
+                params={
+                    "apiKey": ODDS_API_KEY,
+                    "regions": ODDS_REGIONS,
+                    "markets": ODDS_MARKETS,
+                    "oddsFormat": "decimal",
+                    "dateFormat": "iso",
+                },
+                timeout=10,
+            )
+
             if r.status_code != 200:
-                logger.warning("Odds API %s → %s | response: %s", sport_key, r.status_code, r.text)
+                logger.warning("Odds API %s -> %s | response: %s", sport_key, r.status_code, r.text)
+                await asyncio.sleep(ODDS_API_REQUEST_DELAY)
                 continue
 
-            for game in r.json():
+            games = r.json()
+
+            # Si no hay partidos en esta liga, sigue
+            if not games:
+                logger.info("Sin partidos en %s", sport_key)
+                await asyncio.sleep(ODDS_API_REQUEST_DELAY)
+                continue
+
+            found_upcoming_match = False
+
+            for game in games:
                 commence = datetime.fromisoformat(
                     game["commence_time"].replace("Z", "+00:00")
                 )
+
+                # Solo revisar partidos dentro de la ventana
                 if not (now <= commence <= cutoff):
                     continue
 
-                # Señal simple actual
-                value = best_value_outcome(game.get("bookmakers", []))
-                if value is not None:
-                    minutes_to_ko = int((commence - now).total_seconds() / 60)
+                found_upcoming_match = True
 
-                    alerts.append({
-                        "type": "pre_match",
-                        "score": score_pre_match(value["edge"], value["book_count"]),
-                        "league": league_name,
-                        "home": game["home_team"],
-                        "away": game["away_team"],
-                        "kickoff": format_kickoff(game["commence_time"]),
-                        "minutes_to_ko": minutes_to_ko,
-                        "outcome": value["label"],
-                        "odds": value["best_odds"],
-                        "fair_prob": value["fair_prob"],
-                        "edge": value["edge"],
-                        "book_count": value["book_count"],
-                    })
+                home_team = game.get("home_team")
+                away_team = next(
+                    (t for t in game.get("teams", []) if t != home_team),
+                    "Away"
+                )
 
-                # Nuevo parley sugerido
-                parley_alert = build_parley_alert(game, league_name)
-                if parley_alert is not None:
-                    alerts.append(parley_alert)
+                bookmakers = game.get("bookmakers", [])
+                if not bookmakers:
+                    continue
+
+                outcomes_by_team: dict[str, list[float]] = {}
+
+                for bookmaker in bookmakers:
+                    for market in bookmaker.get("markets", []):
+                        if market.get("key") != "h2h":
+                            continue
+                        for outcome in market.get("outcomes", []):
+                            name = outcome.get("name")
+                            price = outcome.get("price")
+                            if name and isinstance(price, (int, float)):
+                                outcomes_by_team.setdefault(name, []).append(float(price))
+
+                if not outcomes_by_team:
+                    continue
+
+                for team_name, prices in outcomes_by_team.items():
+                    if len(prices) < 2:
+                        continue
+
+                    best_odds = max(prices)
+                    avg_odds = mean(prices)
+
+                    if avg_odds <= 1:
+                        continue
+
+                    fair_prob = 1 / avg_odds
+                    implied_prob_best = 1 / best_odds
+                    edge = fair_prob - implied_prob_best
+
+                    if edge >= MIN_VALUE_EDGE:
+                        match_key = f"{sport_key}|{home_team}|{away_team}|{team_name}"
+                        alerts.append({
+                            "match_key": match_key,
+                            "league": league_name,
+                            "home_team": home_team,
+                            "away_team": away_team,
+                            "pick": team_name,
+                            "best_odds": round(best_odds, 2),
+                            "avg_odds": round(avg_odds, 2),
+                            "edge": round(edge * 100, 2),
+                            "commence_time": commence,
+                        })
+
+            if found_upcoming_match:
+                logger.info("Hay partidos próximos en %s", sport_key)
+            else:
+                logger.info("No hay partidos próximos en %s dentro de %s horas", sport_key, PRE_MATCH_WINDOW_HOURS)
+
+            await asyncio.sleep(ODDS_API_REQUEST_DELAY)
 
         except Exception as exc:
-            logger.error("Pre-match fetch error (%s): %s", sport_key, exc)
+            logger.warning("Error consultando %s: %s", sport_key, exc)
+            await asyncio.sleep(ODDS_API_REQUEST_DELAY)
+            continue
 
-        await asyncio.sleep(ODDS_API_REQUEST_DELAY)
+    return alerts
 
-    return sorted(alerts, key=lambda a: -a["score"])
-
-
-async def fetch_live_alerts(client: httpx.AsyncClient) -> list[dict]:
-    alerts: list[dict] = []
-    try:
-        r = await client.get(
-            "https://v3.football.api-sports.io/fixtures",
-            params={"live": "all"},
-            headers={"x-apisports-key": FOOTBALL_API_KEY},
-            timeout=10,
-        )
-        if r.status_code != 200:
-            logger.warning("API-Football live → %s", r.status_code)
-            return []
-
-        for fixture in r.json().get("response", []):
-            league_id = fixture["league"]["id"]
-            if league_id not in LIVE_LEAGUE_IDS:
-                continue
-
-            status_short = fixture["fixture"]["status"]["short"]
-            if status_short not in ("2H", "ET"):
-                continue
-
-            minute = fixture["fixture"]["status"].get("elapsed") or 0
-            if minute < 60:
-                continue
-
-            league_name = fixture["league"]["name"]
-            home = fixture["teams"]["home"]["name"]
-            away = fixture["teams"]["away"]["name"]
-            home_goals = fixture["goals"]["home"] or 0
-            away_goals = fixture["goals"]["away"] or 0
-            goal_diff = abs(home_goals - away_goals)
-
-            red_home = sum(
-                1 for e in fixture.get("events", [])
-                if e.get("team", {}).get("id") == fixture["teams"]["home"]["id"]
-                and e.get("type") == "Card"
-                and e.get("detail") in ("Red Card", "Second Yellow Card")
-            )
-            red_away = sum(
-                1 for e in fixture.get("events", [])
-                if e.get("team", {}).get("id") == fixture["teams"]["away"]["id"]
-                and e.get("type") == "Card"
-                and e.get("detail") in ("Red Card", "Second Yellow Card")
-            )
-
-            signal = None
-
-            if red_home > 0 or red_away > 0:
-                parts = []
-                if red_home > 0:
-                    parts.append(f"🟥 {home} down to {11 - red_home} men")
-                if red_away > 0:
-                    parts.append(f"🟥 {away} down to {11 - red_away} men")
-                signal = {"priority": 3, "reason": " · ".join(parts)}
-
-            elif home_goals == 0 and away_goals == 0:
-                signal = {
-                    "priority": 2,
-                    "reason": f"0-0 at {minute}' — Under 2.5 / BTTS No value",
-                }
-
-            elif goal_diff == 1:
-                leader = home if home_goals > away_goals else away
-                trailer = away if home_goals > away_goals else home
-                signal = {
-                    "priority": 1,
-                    "reason": (
-                        f"{leader} lead by 1 at {minute}' — "
-                        f"{trailer} comeback / Draw value"
-                    ),
-                }
-
-            if signal is None:
-                continue
-
-            alerts.append({
-                "type": "live",
-                "score": score_live(signal["priority"], minute),
-                "priority": signal["priority"],
-                "league": league_name,
-                "home": home,
-                "away": away,
-                "score_str": f"{home_goals}-{away_goals}",
-                "minute": minute,
-                "reason": signal["reason"],
-            })
-
-    except Exception as exc:
-        logger.error("Live fetch error: %s", exc)
-
-    return sorted(alerts, key=lambda a: -a["priority"])
 
 
 # ---------------------------------------------------------------------------
@@ -726,13 +683,40 @@ async def main() -> None:
 
     async with httpx.AsyncClient() as client:
         while True:
-            try:
-                await run_cycle(bot, client)
-            except Exception as exc:
-                logger.error("Cycle error: %s", exc)
+    try:
+        alerts = await fetch_pre_match_alerts(client)
 
-            logger.info("Sleeping %ds until next cycle…", CYCLE_INTERVAL)
-            await asyncio.sleep(CYCLE_INTERVAL)
+        if alerts:
+            for alert in alerts:
+                if alert["match_key"] not in sent_parley_signals:
+                    text = format_pre_match_alert(alert)
+                    await bot.send_message(chat_id=CHAT_ID, text=text)
+                    sent_parley_signals.add(alert["match_key"])
+
+            sleep_seconds = CYCLE_INTERVAL
+            logger.info("Hay partidos cercanos. Durmiendo %ds.", sleep_seconds)
+
+        else:
+            sleep_seconds = 21600  # 6 horas
+            logger.info("No hay partidos cercanos. Durmiendo %ds.", sleep_seconds)
+
+        # Aquí puedes seguir dejando tus live alerts si quieres
+        try:
+            live_alerts = await fetch_live_alerts(client)
+            for alert in live_alerts:
+                if alert["signal_key"] not in sent_live_signals:
+                    text = format_live_alert(alert)
+                    await bot.send_message(chat_id=CHAT_ID, text=text)
+                    sent_live_signals.add(alert["signal_key"])
+        except Exception as exc:
+            logger.warning("Live alerts error: %s", exc)
+
+    except Exception as exc:
+        logger.error("Cycle error: %s", exc)
+        sleep_seconds = CYCLE_INTERVAL
+
+    logger.info("Sleeping %ds until next cycle...", sleep_seconds)
+    await asyncio.sleep(sleep_seconds)
 
 
 if __name__ == "__main__":
