@@ -632,19 +632,20 @@ async def fetch_upcoming_matches(client: httpx.AsyncClient) -> list[dict]:
             r = await client.get(
                 "https://v3.football.api-sports.io/fixtures",
                 params={
-                    "date": date_str,
-                    "timezone": "America/Mexico_City"
-                },
-                headers={"x-apisports-key": FOOTBALL_API_KEY},
-                timeout=10,
+                    "league": 262,  # Liga MX
+                    "season": 2026,
+                    "timezone": "America/Mexico_City". 
+               },
+               headers={"x-apisports-key": FOOTBALL_API_KEY},
+               timeout=10,
             )
 
             if r.status_code != 200:
-                logger.warning("API-Football fixtures %s -> %s | %s", date_str, r.status_code, r.text)
-                continue
+                logger.warning("API-Football error -> %s | %s", r.status_code, r.text)
+                return matches
 
-            response_data = r.json().get("response", [])
-            logger.info("Fixtures recibidos para %s: %s", date_str, len(response_data))
+            data = r.json().get("response", [])
+            logger.info("Fixtures Liga MX recibidos: %s", len(data))
             data.extend(response_data)
 
         seen_match_ids = set()
