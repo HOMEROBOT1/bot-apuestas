@@ -665,7 +665,8 @@ async def fetch_upcoming_matches(client: httpx.AsyncClient) -> list[dict]:
 
             if not home or not away:
                 continue
-
+           
+            logger.info("Match encontrado: %s vs %s", home, away)
             matches.append({
                 "match_key": str(fixture.get("id")),
                 "league": league.get("name", "Liga"),
@@ -818,6 +819,7 @@ async def main():
     bot = Bot(token=BOT_TOKEN)
     info = await bot.get_me()
     logger.info("Bot online: @%s", info.username)
+    await bot.send_message(chat_id=CHAT_ID, text="✅ Bot activo y prueba OK")
 
     async with httpx.AsyncClient() as client:
         while True:
@@ -835,10 +837,15 @@ async def main():
                     logger.info("Fuera de horario. Durmiendo hasta 7:00 AM (%ds).", sleep_seconds)
                     await asyncio.sleep(sleep_seconds)
                     continue
+                  
+                  await bot.send_message(chat_id=CHAT_ID, text="✅ Bot activo y prueba OK")
 
-                upcoming_matches = await fetch_upcoming_matches(client)
+                    upcoming_matches = await fetch_upcoming_matches(client)
+                    logger.info("Próximos partidos detectados: %s", len(upcoming_matches))
 
                 for match in upcoming_matches:
+                    logger.info("Intentando enviar: %s vs %s", match["home_team"], match["away_team"])
+
                     if match["match_key"] not in sent_upcoming_match_alerts:
                         text = format_upcoming_match_alert(match)
                         await bot.send_message(chat_id=CHAT_ID, text=text)
