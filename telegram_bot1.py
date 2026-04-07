@@ -390,8 +390,8 @@ async def fetch_pre_match_alerts(bot: Bot, client: httpx.AsyncClient) -> list[di
     alerts: list[dict] = []
     global odds_credits_alert_sent
 
-    if 0 <= (match_time - now).total_seconds() <= 10800:
-    cutoff = now + timedelta(hours=PRE_MATCH_WINDOW_HOURS)
+    now = datetime.now(timezone.utc)
+cutoff = now + timedelta(hours=PRE_MATCH_WINDOW_HOURS)
 
     for sport_key, league_name in WHITELISTED_SPORTS.items():
         try:
@@ -437,8 +437,9 @@ async def fetch_pre_match_alerts(bot: Bot, client: httpx.AsyncClient) -> list[di
                     game["commence_time"].replace("Z", "+00:00")
                 )
 
-                if not (now <= commence <= cutoff):
-                    continue
+                # incluir partidos en vivo (hasta 2 horas después de iniciar)
+if not (-7200 <= (commence - now).total_seconds() <= PRE_MATCH_WINDOW_HOURS * 3600):
+    continue
 
                 home_team = game.get("home_team")
                 away_team = next(
