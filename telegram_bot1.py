@@ -24,6 +24,7 @@ from zoneinfo import ZoneInfo
 
 sent_live_signals = set()
 sent_parley_signals = set()
+sent_upcoming_match_alerts = set()
 odds_credits_alert_sent = False
 
 # ---------------------------------------------------------------------------
@@ -606,6 +607,77 @@ async def send_message(bot: Bot, text: str) -> None:
     except TelegramError as exc:
         logger.error("Telegram error: %s", exc)
 
+def format_upcoming_match_alert(match: dict) -> str:
+    local_time = match["kickoff"].astimezone()
+    hour_text = local_time.strftime("%I:%M %p").lstrip("0")
+
+    return (
+        f"📅 PRÓXIMO PARTIDO\n\n"
+        f"{match['home_team']} vs {match['away_team']}\n"
+        f"Liga: {match['league']}\n"
+        f"Hora: {hour_text}"
+    )
+  
+async def fetch_upcoming_matches(client: httpx.AsyncClient) -> list[dict]:
+    matches: list[dict] = []
+
+    try:
+        now = datetime.now(timezone.utc)
+        today_str = now.strftime("%Y-%m-%d")
+
+        r = await client.get(
+            "https://v3.football.api-sports.io/fixtures",
+            params={"date": today_str},
+            headers={"x-apisports-key": FOOTBALL_API_KEY},
+            timeout=10,
+        )
+
+        if r.status_code != 200:
+            logger.warning("API-Football fixtures -> %s | %s", r.status_code, r.text)
+            return matches
+
+        data = r.json().get("response", [])
+
+        allowed_league_ids = set(LIVE_LEAGUE_IDS)
+
+        for item in data:
+            league = item.get("league", {})
+            fixture = item.get("fixture", {})
+            teams = item.get("teams", {})
+
+            league_id = league.get("id")
+            if league_id not in allowed_league_ids:
+                continue
+
+            kickoff_str = fixture.get("date")
+            if not kickoff_str:
+                continue
+
+            kickoff = datetime.fromisoformat(kickoff_str.replace("Z", "+00:00"))
+            local_hour = kickoff.astimezone().hour
+
+            # Solo partidos entre 7 AM y 10 PM hora local
+            if not (7 <= local_hour < 22):
+                continue
+
+            home_team = teams.get("home", {}).get("name", "Home")
+            away_team = teams.get("away", {}).get("name", "Away")
+            league_name = league.get("name", "Liga")
+
+            match_key = f"{league_id}|{home_team}|{away_team}|{kickoff.isoformat()}"
+
+            matches.append({
+                "match_key": match_key,
+                "league": league_name,
+                "home_team": home_team,
+                "away_team": away_team,
+                "kickoff": kickoff,
+            })
+
+    except Exception as exc:
+        logger.warning("Error obteniendo próximos partidos: %s", exc)
+
+    return matches
 
 # ---------------------------------------------------------------------------
 # Main loop
@@ -748,6 +820,13 @@ async def main():
                     logger.info("Fuera de horario. Durmiendo hasta 7:00 AM (%ds).", sleep_seconds)
                     await asyncio.sleep(sleep_seconds)
                     continue
+                                  upcoming_matches = await fetch_upcoming_matches(client)
+
+                for match in upcoming_matches:
+                    if match["match_key"] not in sent_upcoming_match_alerts:
+                        text = format_upcoming_match_alert(match)
+                        await bot.send_message(chat_id=CHAT_ID, text=text)
+                        sent_upcoming_match_alerts.add(match["match_key"])
 
                 alerts = await fetch_pre_match_alerts(bot, client)
 
