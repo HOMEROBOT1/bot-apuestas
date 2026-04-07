@@ -731,7 +731,7 @@ async def main():
     logger.info("Bot online: @%s", info.username)
 
     async with httpx.AsyncClient() as client:
-                while True:
+        while True:
             try:
                 now_local = datetime.now(ZoneInfo("America/Mexico_City"))
                 hour = now_local.hour
@@ -743,7 +743,7 @@ async def main():
                         next_start = next_start + timedelta(days=1)
 
                     sleep_seconds = int((next_start - now_local).total_seconds())
-                    logger.info("Fuera de horario. Durmiendo hasta mañana a las 7:00 AM (%ds).", sleep_seconds)
+                    logger.info("Fuera de horario. Durmiendo hasta 7:00 AM (%ds).", sleep_seconds)
                     await asyncio.sleep(sleep_seconds)
                     continue
 
@@ -758,6 +758,7 @@ async def main():
 
                     sleep_seconds = 60
                     logger.info("Hay partidos cercanos. Revisando en %ds...", sleep_seconds)
+
                 else:
                     sleep_seconds = 1800
                     logger.info("No hay partidos cercanos. Revisando en %ds...", sleep_seconds)
