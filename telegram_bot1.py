@@ -682,8 +682,8 @@ async def main() -> None:
         )
 
     async with httpx.AsyncClient() as client:
-        while True:
-    try:
+      while True:
+          try:
         alerts = await fetch_pre_match_alerts(client)
 
         if alerts:
@@ -700,7 +700,6 @@ async def main() -> None:
             sleep_seconds = 21600  # 6 horas
             logger.info("No hay partidos cercanos. Durmiendo %ds.", sleep_seconds)
 
-        # Aquí puedes seguir dejando tus live alerts si quieres
         try:
             live_alerts = await fetch_live_alerts(client)
             for alert in live_alerts:
