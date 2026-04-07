@@ -16,6 +16,7 @@ import re
 import httpx
 from telegram import Bot
 from telegram.error import TelegramError
+from zoneinfo import ZoneInfo
 
 # ---------------------------------------------------------------------------
 # Runtime dedupe
@@ -730,8 +731,22 @@ async def main():
     logger.info("Bot online: @%s", info.username)
 
     async with httpx.AsyncClient() as client:
-        while True:
+                while True:
             try:
+                now_local = datetime.now(ZoneInfo("America/Mexico_City"))
+                hour = now_local.hour
+
+                if hour < 7 or hour >= 22:
+                    next_start = now_local.replace(hour=7, minute=0, second=0, microsecond=0)
+
+                    if hour >= 22:
+                        next_start = next_start + timedelta(days=1)
+
+                    sleep_seconds = int((next_start - now_local).total_seconds())
+                    logger.info("Fuera de horario. Durmiendo hasta mañana a las 7:00 AM (%ds).", sleep_seconds)
+                    await asyncio.sleep(sleep_seconds)
+                    continue
+
                 alerts = await fetch_pre_match_alerts(bot, client)
 
                 if alerts:
