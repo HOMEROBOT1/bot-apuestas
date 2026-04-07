@@ -644,11 +644,17 @@ async def fetch_upcoming_matches(client: httpx.AsyncClient) -> list[dict]:
      
 
         allowed_league_ids = None
-
+        seen_match_ids = set()
+      
         for item in data:
             league = item.get("league", {})
             fixture = item.get("fixture", {})
             teams = item.get("teams", {})
+          
+            fixture_id = fixture.get("id")
+            if not fixture_id or fixture_id in seen_match_ids:
+                continue
+            seen_match_ids.add(fixture_id)
 
             status = fixture.get("status", {}).get("short")
 
