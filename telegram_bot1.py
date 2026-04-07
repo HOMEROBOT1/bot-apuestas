@@ -641,17 +641,23 @@ async def fetch_upcoming_matches(client: httpx.AsyncClient) -> list[dict]:
         allowed_league_ids = None
 
         for item in data:
-            league = item.get("league", {})
-            fixture = item.get("fixture", {})
-            teams = item.get("teams", {})
+    league = item.get("league", {})
+    fixture = item.get("fixture", {})
+    teams = item.get("teams", {})
 
-            league_id = league.get("id")
-            if allowed_league_ids and league.get("id") not in allowed_league_ids:
-                continue
+    status = fixture.get("status", {}).get("short")
 
-            kickoff_str = fixture.get("date")
-            if not kickoff_str:
-                continue
+    # Solo partidos que no han empezado
+    if status not in ["NS", "TBD"]:
+        continue
+
+    league_id = league.get("id")
+    if allowed_league_ids and league.get("id") not in allowed_league_ids:
+        continue
+
+    kickoff_str = fixture.get("date")
+    if not kickoff_str:
+        continue
 
             kickoff = datetime.fromisoformat(kickoff_str.replace("Z", "+00:00"))
             local_hour = kickoff.astimezone().hour
