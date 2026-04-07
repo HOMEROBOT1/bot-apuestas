@@ -826,7 +826,7 @@ async def main():
             try:
                 upcoming_matches = []
                 now_local = datetime.now(ZoneInfo("America/Mexico_City"))
-                hour = now_local.hour
+                today_str = now_local.strftime("%Y-%m-%d")
 
                 if hour < 7 or hour >= 22:
                     next_start = now_local.replace(hour=7, minute=0, second=0, microsecond=0)
