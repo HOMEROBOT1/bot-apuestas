@@ -710,7 +710,7 @@ async def fetch_live_alerts(client: httpx.AsyncClient) -> list[dict]:
         logger.warning("Error en live fetch: %s", exc)
 
     return alerts
-  def format_live_alert(alert: dict) -> str:
+def format_live_alert(alert: dict) -> str:
     return (
         f"🔥 ALERTA EN VIVO\n\n"
         f"{alert['home']} vs {alert['away']}\n"
