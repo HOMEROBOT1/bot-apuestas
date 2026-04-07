@@ -406,18 +406,18 @@ async def fetch_pre_match_alerts(bot: Bot, client: httpx.AsyncClient) -> list[di
                 timeout=10,
             )
 
-            if r.status_code != 200:
+if r.status_code != 200:
     logger.warning("Odds API %s -> %s | response: %s", sport_key, r.status_code, r.text)
 
     if "OUT_OF_USAGE_CREDITS" in r.text and not odds_credits_alert_sent:
         try:
             await bot.send_message(
                 chat_id=CHAT_ID,
-                text="⚠️ Aviso: te quedaste sin créditos en The Odds API. Las alertas pre-partido quedarán pausadas hasta que se reinicie tu cuota o recargues créditos."
+                text="⚠️ Aviso: te quedaste sin créditos en The Odds API."
             )
             odds_credits_alert_sent = True
         except Exception as exc:
-            logger.warning("No se pudo enviar alerta de créditos agotados: %s", exc)
+            logger.warning("Error enviando alerta de créditos: %s", exc)
 
     await asyncio.sleep(ODDS_API_REQUEST_DELAY)
     continue
