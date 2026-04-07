@@ -391,7 +391,7 @@ async def fetch_pre_match_alerts(bot: Bot, client: httpx.AsyncClient) -> list[di
     global odds_credits_alert_sent
 
     now = datetime.now(timezone.utc)
-cutoff = now + timedelta(hours=PRE_MATCH_WINDOW_HOURS)
+    cutoff = now + timedelta(hours=PRE_MATCH_WINDOW_HOURS)
 
     for sport_key, league_name in WHITELISTED_SPORTS.items():
         try:
