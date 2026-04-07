@@ -425,7 +425,7 @@ async def fetch_pre_match_alerts(bot: Bot, client: httpx.AsyncClient) -> list[di
 
             odds_credits_alert_sent = False
 
-            games = r.json()
+                        games = r.json()
 
             if not games:
                 logger.info("Sin partidos en %s", sport_key)
@@ -437,9 +437,8 @@ async def fetch_pre_match_alerts(bot: Bot, client: httpx.AsyncClient) -> list[di
                     game["commence_time"].replace("Z", "+00:00")
                 )
 
-                # incluir partidos en vivo (hasta 2 horas después de iniciar)
-if not (-7200 <= (commence - now).total_seconds() <= PRE_MATCH_WINDOW_HOURS * 3600):
-    continue
+                if not (-7200 <= (commence - now).total_seconds() <= PRE_MATCH_WINDOW_HOURS * 3600):
+                    continue
 
                 home_team = game.get("home_team")
                 away_team = next(
@@ -494,7 +493,7 @@ if not (-7200 <= (commence - now).total_seconds() <= PRE_MATCH_WINDOW_HOURS * 36
                             "commence_time": commence,
                         })
 
-            await asyncio.sleep(ODDS_API_REQUEST_DELAY)
+                await asyncio.sleep(ODDS_API_REQUEST_DELAY)
 
         except Exception as exc:
             logger.warning("Error consultando %s: %s", sport_key, exc)
