@@ -405,7 +405,7 @@ async def fetch_pre_match_alerts(client: httpx.AsyncClient) -> list[dict]:
     timeout=10,
 )
             if r.status_code != 200:
-                logger.warning("Odds API %s → %s", sport_key, r.status_code)
+                logger.warning("Odds API %s → %s | response: %s", sport_key, r.status_code, r.text)
                 continue
 
             for game in r.json():
