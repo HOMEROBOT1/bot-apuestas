@@ -820,14 +820,15 @@ async def main():
                     logger.info("Fuera de horario. Durmiendo hasta 7:00 AM (%ds).", sleep_seconds)
                     await asyncio.sleep(sleep_seconds)
                     continue
-                                  upcoming_matches = await fetch_upcoming_matches(client)
 
-                for match in upcoming_matches:
-                    if match["match_key"] not in sent_upcoming_match_alerts:
-                        text = format_upcoming_match_alert(match)
-                        await bot.send_message(chat_id=CHAT_ID, text=text)
-                        sent_upcoming_match_alerts.add(match["match_key"])
+            upcoming_matches = await fetch_upcoming_matches(client)
 
+            for match in upcoming_matches:
+                if match["match_key"] not in sent_upcoming_match_alerts:
+                    text = format_upcoming_match_alert(match)
+                    await bot.send_message(chat_id=CHAT_ID, text=text)
+                    sent_upcoming_match_alerts.add(match["match_key"])
+                  
                 alerts = await fetch_pre_match_alerts(bot, client)
 
                 if alerts:
