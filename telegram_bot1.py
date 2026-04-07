@@ -635,7 +635,7 @@ async def fetch_upcoming_matches(client: httpx.AsyncClient) -> list[dict]:
                     "league": 262,  # Liga MX
                     "season": 2026,
                     "timezone": "America/Mexico_City". 
-                },
+                }
                headers={"x-apisports-key": FOOTBALL_API_KEY},
                timeout=10,
             )
