@@ -743,9 +743,13 @@ async def main():
 
                     sleep_seconds = CYCLE_INTERVAL
                     logger.info("Hay partidos cercanos. Durmiendo %ds.", sleep_seconds)
-                else:
-                    sleep_seconds = 21600  # 6 horas
-                    logger.info("No hay partidos cercanos. Durmiendo %ds.", sleep_seconds)
+    
+               if alerts:
+                   sleep_seconds = 60  # hay partidos cerca → revisar rápido 🔥
+                   logger.info("Hay partidos cercanos. Revisando en %ds...", sleep_seconds)
+               else:
+                   sleep_seconds = 3600 # no hay partidos → cada 1 hora 🧠
+                   logger.info("No hay partidos cercanos. Revisando en %ds...", sleep_seconds)
 
                 try:
                     live_alerts = await fetch_live_alerts(client)
