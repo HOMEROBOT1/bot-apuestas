@@ -640,7 +640,6 @@ async def fetch_upcoming_matches(client: httpx.AsyncClient) -> list[dict]:
 
         allowed_league_ids = None
 
-        
         for item in data:
             league = item.get("league", {})
             fixture = item.get("fixture", {})
@@ -648,18 +647,17 @@ async def fetch_upcoming_matches(client: httpx.AsyncClient) -> list[dict]:
 
             status = fixture.get("status", {}).get("short")
 
-            # Solo partidos que no han empezado
             if status not in ["NS", "TBD"]:
                 continue
 
             league_id = league.get("id")
             if allowed_league_ids and league_id not in allowed_league_ids:
                 continue
-  
+
             kickoff_str = fixture.get("date")
             if not kickoff_str:
                 continue
-  
+
             kickoff = datetime.fromisoformat(kickoff_str.replace("Z", "+00:00"))
 
             home = teams.get("home", {}).get("name")
@@ -668,17 +666,19 @@ async def fetch_upcoming_matches(client: httpx.AsyncClient) -> list[dict]:
             if not home or not away:
                 continue
 
-              matches.append({
-              "match_key": str(fixture.get("id")),
-              "home": home,
-              "away": away,
-              "time": kickoff
-    })
+            matches.append({
+                "match_key": str(fixture.get("id")),
+                "league": league.get("name", "Liga"),
+                "home_team": home,
+                "away_team": away,
+                "kickoff": kickoff,
+            })
+
+        return matches
 
     except Exception as exc:
         logger.warning("Error obteniendo próximos partidos: %s", exc)
-
-    return matches
+        return matches
   
 def format_pre_match_alert(alert: dict) -> str:
     local_time = alert["commence_time"].astimezone()
