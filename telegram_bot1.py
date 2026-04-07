@@ -680,42 +680,43 @@ async def main() -> None:
             "FOOTBALL_API_KEY secret not set — live alerts disabled. "
             "Get a free key at https://api-sports.io"
         )
-
-    async with httpx.AsyncClient() as client:
-      while True:
-          try:
-        alerts = await fetch_pre_match_alerts(client)
-
-        if alerts:
-            for alert in alerts:
-                if alert["match_key"] not in sent_parley_signals:
-                    text = format_pre_match_alert(alert)
-                    await bot.send_message(chat_id=CHAT_ID, text=text)
-                    sent_parley_signals.add(alert["match_key"])
-
-            sleep_seconds = CYCLE_INTERVAL
-            logger.info("Hay partidos cercanos. Durmiendo %ds.", sleep_seconds)
-
-        else:
-            sleep_seconds = 21600  # 6 horas
-            logger.info("No hay partidos cercanos. Durmiendo %ds.", sleep_seconds)
-
+async with httpx.AsyncClient() as client:
+    while True:
         try:
-            live_alerts = await fetch_live_alerts(client)
-            for alert in live_alerts:
-                if alert["signal_key"] not in sent_live_signals:
-                    text = format_live_alert(alert)
-                    await bot.send_message(chat_id=CHAT_ID, text=text)
-                    sent_live_signals.add(alert["signal_key"])
+            alerts = await fetch_pre_match_alerts(client)
+
+            if alerts:
+                for alert in alerts:
+                    if alert["match_key"] not in sent_parley_signals:
+                        text = format_pre_match_alert(alert)
+                        await bot.send_message(chat_id=CHAT_ID, text=text)
+                        sent_parley_signals.add(alert["match_key"])
+
+                sleep_seconds = CYCLE_INTERVAL
+                logger.info("Hay partidos cercanos. Durmiendo %ds.", sleep_seconds)
+
+            else:
+                sleep_seconds = 21600  # 6 horas
+                logger.info("No hay partidos cercanos. Durmiendo %ds.", sleep_seconds)
+
+            try:
+                live_alerts = await fetch_live_alerts(client)
+                for alert in live_alerts:
+                    if alert["signal_key"] not in sent_live_signals:
+                        text = format_live_alert(alert)
+                        await bot.send_message(chat_id=CHAT_ID, text=text)
+                        sent_live_signals.add(alert["signal_key"])
+            except Exception as exc:
+                logger.warning("Live alerts error: %s", exc)
+
         except Exception as exc:
-            logger.warning("Live alerts error: %s", exc)
+            logger.error("Cycle error: %s", exc)
+            sleep_seconds = CYCLE_INTERVAL
 
-    except Exception as exc:
-        logger.error("Cycle error: %s", exc)
-        sleep_seconds = CYCLE_INTERVAL
+        logger.info("Sleeping %ds until next cycle...", sleep_seconds)
+        await asyncio.sleep(sleep_seconds)
 
-    logger.info("Sleeping %ds until next cycle...", sleep_seconds)
-    await asyncio.sleep(sleep_seconds)
+
 
 
 if __name__ == "__main__":
