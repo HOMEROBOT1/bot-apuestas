@@ -622,6 +622,7 @@ async def fetch_upcoming_matches(client: httpx.AsyncClient) -> list[dict]:
     matches: list[dict] = []
 
     try:
+        now_local = datetime.now(ZoneInfo("America/Mexico_City"))
         today_str = now_local.strftime("%Y-%m-%d")
         tomorrow_str = (now_local + timedelta(days=1)).strftime("%Y-%m-%d")
 
