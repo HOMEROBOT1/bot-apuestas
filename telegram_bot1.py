@@ -424,8 +424,7 @@ async def fetch_pre_match_alerts(bot: Bot, client: httpx.AsyncClient) -> list[di
                 continue
 
             odds_credits_alert_sent = False
-
-                        games = r.json()
+            games = r.json()
 
             if not games:
                 logger.info("Sin partidos en %s", sport_key)
@@ -493,7 +492,7 @@ async def fetch_pre_match_alerts(bot: Bot, client: httpx.AsyncClient) -> list[di
                             "commence_time": commence,
                         })
 
-                await asyncio.sleep(ODDS_API_REQUEST_DELAY)
+            await asyncio.sleep(ODDS_API_REQUEST_DELAY)
 
         except Exception as exc:
             logger.warning("Error consultando %s: %s", sport_key, exc)
