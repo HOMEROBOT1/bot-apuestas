@@ -640,53 +640,50 @@ async def fetch_upcoming_matches(client: httpx.AsyncClient) -> list[dict]:
                 logger.warning("API-Football fixtures %s -> %s | %s", date_str, r.status_code, r.text)
                 continue
 
-            data.extend(r.json().get("response", []))
+            response_data = r.json().get("response", [])
+            logger.info("Fixtures recibidos para %s: %s", date_str, len(response_data))
+            data.extend(response_data)
 
-     
-
-        allowed_league_ids = None
         seen_match_ids = set()
-      
+
         for item in data:
             league = item.get("league", {})
             fixture = item.get("fixture", {})
             teams = item.get("teams", {})
-          
+
             fixture_id = fixture.get("id")
             if not fixture_id or fixture_id in seen_match_ids:
                 continue
             seen_match_ids.add(fixture_id)
 
             status = fixture.get("status", {}).get("short")
-
-            if status not in ["NS", "TBD"]:
-                continue
-
-            league_id = league.get("id")
-            if allowed_league_ids and league_id not in allowed_league_ids:
-                continue
-
             kickoff_str = fixture.get("date")
+            home = teams.get("home", {}).get("name")
+            away = teams.get("away", {}).get("name")
+
+            logger.info(
+                "RAW fixture -> liga=%s | home=%s | away=%s | status=%s | date=%s",
+                league.get("name"),
+                home,
+                away,
+                status,
+                kickoff_str,
+            )
+
             if not kickoff_str:
                 continue
 
             kickoff = datetime.fromisoformat(kickoff_str.replace("Z", "+00:00"))
 
-            home = teams.get("home", {}).get("name")
-            away = teams.get("away", {}).get("name")
-
-            if not home or not away:
-                continue
-           
-            logger.info("Match encontrado: %s vs %s", home, away)
             matches.append({
-                "match_key": str(fixture.get("id")),
+                "match_key": str(fixture_id),
                 "league": league.get("name", "Liga"),
-                "home_team": home,
-                "away_team": away,
+                "home_team": home or "Home",
+                "away_team": away or "Away",
                 "kickoff": kickoff,
             })
 
+        logger.info("Próximos partidos finales: %s", len(matches))
         return matches
 
     except Exception as exc:
