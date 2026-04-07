@@ -631,7 +631,10 @@ async def fetch_upcoming_matches(client: httpx.AsyncClient) -> list[dict]:
         for date_str in [today_str, tomorrow_str]:
             r = await client.get(
                 "https://v3.football.api-sports.io/fixtures",
-                params={"date": date_str},
+                params={
+                    "date": date_str,
+                    "timezone": "America/Mexico_City"
+                },
                 headers={"x-apisports-key": FOOTBALL_API_KEY},
                 timeout=10,
             )
