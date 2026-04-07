@@ -663,7 +663,61 @@ async def run_cycle(bot: Bot, client: httpx.AsyncClient) -> None:
             sent_live_signals.add(signal_key)
 
         await asyncio.sleep(1)
+      
+async def fetch_live_alerts(client: httpx.AsyncClient) -> list[dict]:
+    alerts = []
 
+    try:
+        r = await client.get(
+            "https://v3.football.api-sports.io/fixtures",
+            params={"live": "all"},
+            headers={"x-apisports-key": FOOTBALL_API_KEY},
+            timeout=10,
+        )
+
+        if r.status_code != 200:
+            logger.warning("API-Football live -> %s | %s", r.status_code, r.text)
+            return alerts
+
+        data = r.json().get("response", [])
+
+        for match in data:
+            fixture = match.get("fixture", {})
+            teams = match.get("teams", {})
+            goals = match.get("goals", {})
+
+            home = teams.get("home", {}).get("name")
+            away = teams.get("away", {}).get("name")
+
+            home_goals = goals.get("home", 0)
+            away_goals = goals.get("away", 0)
+
+            minute = fixture.get("status", {}).get("elapsed", 0)
+
+            # Ejemplo simple de señal: empate en minuto 70+
+            if minute and minute >= 70 and home_goals == away_goals:
+                signal_key = f"{home}-{away}-{minute}"
+
+                alerts.append({
+                    "signal_key": signal_key,
+                    "home": home,
+                    "away": away,
+                    "minute": minute,
+                    "score": f"{home_goals}-{away_goals}",
+                })
+
+    except Exception as exc:
+        logger.warning("Error en live fetch: %s", exc)
+
+    return alerts
+  def format_live_alert(alert: dict) -> str:
+    return (
+        f"🔥 ALERTA EN VIVO\n\n"
+        f"{alert['home']} vs {alert['away']}\n"
+        f"Marcador: {alert['score']}\n"
+        f"Minuto: {alert['minute']}\n\n"
+        f"📊 Posible oportunidad en vivo"
+    )
 
 async def main():
     if not BOT_TOKEN:
