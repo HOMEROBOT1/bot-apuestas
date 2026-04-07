@@ -734,22 +734,19 @@ async def main():
             try:
                 alerts = await fetch_pre_match_alerts(bot, client)
 
-                if alerts:
-                    for alert in alerts:
-                        if alert["match_key"] not in sent_parley_signals:
-                            text = format_pre_match_alert(alert)
-                            await bot.send_message(chat_id=CHAT_ID, text=text)
-                            sent_parley_signals.add(alert["match_key"])
+if alerts:
+    for alert in alerts:
+        if alert["match_key"] not in sent_parley_signals:
+            text = format_pre_match_alert(alert)
+            await bot.send_message(chat_id=CHAT_ID, text=text)
+            sent_parley_signals.add(alert["match_key"])
 
-                    sleep_seconds = CYCLE_INTERVAL
-                    logger.info("Hay partidos cercanos. Durmiendo %ds.", sleep_seconds)
-    
-               if alerts:
-                   sleep_seconds = 60  # hay partidos cerca → revisar rápido 🔥
-                   logger.info("Hay partidos cercanos. Revisando en %ds...", sleep_seconds)
-               else:
-                   sleep_seconds = 3600 # no hay partidos → cada 1 hora 🧠
-                   logger.info("No hay partidos cercanos. Revisando en %ds...", sleep_seconds)
+    sleep_seconds = 60
+    logger.info("Hay partidos cercanos. Revisando en %ds...", sleep_seconds)
+
+else:
+    sleep_seconds = 3600
+    logger.info("No hay partidos cercanos. Revisando en %ds...", sleep_seconds)
 
                 try:
                     live_alerts = await fetch_live_alerts(client)
