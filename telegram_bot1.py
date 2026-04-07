@@ -622,21 +622,26 @@ async def fetch_upcoming_matches(client: httpx.AsyncClient) -> list[dict]:
     matches: list[dict] = []
 
     try:
-        now = datetime.now(timezone.utc)
-        today_str = now.strftime("%Y-%m-%d")
+        today_str = now_local.strftime("%Y-%m-%d")
+        tomorrow_str = (now_local + timedelta(days=1)).strftime("%Y-%m-%d")
 
-        r = await client.get(
-            "https://v3.football.api-sports.io/fixtures",
-            params={"date": today_str},
-            headers={"x-apisports-key": FOOTBALL_API_KEY},
-            timeout=10,
-        )
+        data = []
 
-        if r.status_code != 200:
-            logger.warning("API-Football fixtures -> %s | %s", r.status_code, r.text)
-            return matches
+        for date_str in [today_str, tomorrow_str]:
+            r = await client.get(
+                "https://v3.football.api-sports.io/fixtures",
+                params={"date": date_str},
+                headers={"x-apisports-key": FOOTBALL_API_KEY},
+                timeout=10,
+            )
 
-        data = r.json().get("response", [])
+            if r.status_code != 200:
+                logger.warning("API-Football fixtures %s -> %s | %s", date_str, r.status_code, r.text)
+                continue
+
+            data.extend(r.json().get("response", []))
+
+     
 
         allowed_league_ids = None
 
@@ -819,7 +824,6 @@ async def main():
     bot = Bot(token=BOT_TOKEN)
     info = await bot.get_me()
     logger.info("Bot online: @%s", info.username)
-    await bot.send_message(chat_id=CHAT_ID, text="✅ Bot activo y prueba OK")
 
     async with httpx.AsyncClient() as client:
         while True:
