@@ -837,8 +837,7 @@ async def main():
                     logger.info("Fuera de horario. Durmiendo hasta 7:00 AM (%ds).", sleep_seconds)
                     await asyncio.sleep(sleep_seconds)
                     continue
-                  
-                  await bot.send_message(chat_id=CHAT_ID, text="✅ Bot activo y prueba OK")
+                    await bot.send_message(chat_id=CHAT_ID, text="✅ Bot activo y prueba OK")
 
                     upcoming_matches = await fetch_upcoming_matches(client)
                     logger.info("Próximos partidos detectados: %s", len(upcoming_matches))
