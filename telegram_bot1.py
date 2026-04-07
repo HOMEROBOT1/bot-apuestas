@@ -640,38 +640,39 @@ async def fetch_upcoming_matches(client: httpx.AsyncClient) -> list[dict]:
 
         allowed_league_ids = None
 
-  for item in data:
-    league = item.get("league", {})
-    fixture = item.get("fixture", {})
-    teams = item.get("teams", {})
+        
+        for item in data:
+            league = item.get("league", {})
+            fixture = item.get("fixture", {})
+            teams = item.get("teams", {})
 
-    status = fixture.get("status", {}).get("short")
+            status = fixture.get("status", {}).get("short")
 
-    # Solo partidos que no han empezado
-    if status not in ["NS", "TBD"]:
-        continue
+            # Solo partidos que no han empezado
+          if status not in ["NS", "TBD"]:
+              continue
 
-    league_id = league.get("id")
-    if allowed_league_ids and league_id not in allowed_league_ids:
-        continue
+              league_id = league.get("id")
+          if allowed_league_ids and league_id not in allowed_league_ids:
+              continue
+  
+              kickoff_str = fixture.get("date")
+          if not kickoff_str:
+              continue
+  
+              kickoff = datetime.fromisoformat(kickoff_str.replace("Z", "+00:00"))
 
-    kickoff_str = fixture.get("date")
-    if not kickoff_str:
-        continue
+              home = teams.get("home", {}).get("name")
+              away = teams.get("away", {}).get("name")
 
-    kickoff = datetime.fromisoformat(kickoff_str.replace("Z", "+00:00"))
+          if not home or not away:
+              continue
 
-    home = teams.get("home", {}).get("name")
-    away = teams.get("away", {}).get("name")
-
-    if not home or not away:
-        continue
-
-    matches.append({
-        "match_key": str(fixture.get("id")),
-        "home": home,
-        "away": away,
-        "time": kickoff
+              matches.append({
+              "match_key": str(fixture.get("id")),
+              "home": home,
+              "away": away,
+              "time": kickoff
     })
 
     except Exception as exc:
