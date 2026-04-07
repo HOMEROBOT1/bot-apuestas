@@ -831,19 +831,19 @@ async def main():
 
                 alerts = await fetch_pre_match_alerts(bot, client)
 
-if alerts:
-    for alert in alerts:
-        if alert["match_key"] not in sent_parley_signals:
-            text = format_pre_match_alert(alert)
-            await bot.send_message(chat_id=CHAT_ID, text=text)
-            sent_parley_signals.add(alert["match_key"])
+                if alerts:
+                    for alert in alerts:
+                        if alert["match_key"] not in sent_parley_signals:
+                            text = format_pre_match_alert(alert)
+                            await bot.send_message(chat_id=CHAT_ID, text=text)
+                            sent_parley_signals.add(alert["match_key"])
 
-if upcoming_matches:
-    sleep_seconds = 60
-    logger.info("Hay partidos programados hoy. Revisando en %ds...", sleep_seconds)
-else:
-    sleep_seconds = 1800
-    logger.info("No hay partidos programados. Revisando en %ds...", sleep_seconds)
+                if upcoming_matches:
+                    sleep_seconds = 60
+                    logger.info("Hay partidos programados hoy. Revisando en %ds...", sleep_seconds)
+                else:
+                    sleep_seconds = 1800
+                    logger.info("No hay partidos programados. Revisando en %ds...", sleep_seconds)
 
                 try:
                     live_alerts = await fetch_live_alerts(client)
@@ -861,7 +861,6 @@ else:
 
             logger.info("Sleeping %ds until next cycle...", sleep_seconds)
             await asyncio.sleep(sleep_seconds)
-
 
 
 
