@@ -640,7 +640,7 @@ async def fetch_upcoming_matches(client: httpx.AsyncClient) -> list[dict]:
 
         allowed_league_ids = None
 
-        for item in data:
+  for item in data:
     league = item.get("league", {})
     fixture = item.get("fixture", {})
     teams = item.get("teams", {})
@@ -652,33 +652,27 @@ async def fetch_upcoming_matches(client: httpx.AsyncClient) -> list[dict]:
         continue
 
     league_id = league.get("id")
-    if allowed_league_ids and league.get("id") not in allowed_league_ids:
+    if allowed_league_ids and league_id not in allowed_league_ids:
         continue
 
     kickoff_str = fixture.get("date")
     if not kickoff_str:
         continue
 
-            kickoff = datetime.fromisoformat(kickoff_str.replace("Z", "+00:00"))
-            local_hour = kickoff.astimezone().hour
+    kickoff = datetime.fromisoformat(kickoff_str.replace("Z", "+00:00"))
 
-            # Solo partidos entre 7 AM y 10 PM hora local
-            if not (7 <= local_hour < 22):
-                continue
+    home = teams.get("home", {}).get("name")
+    away = teams.get("away", {}).get("name")
 
-            home_team = teams.get("home", {}).get("name", "Home")
-            away_team = teams.get("away", {}).get("name", "Away")
-            league_name = league.get("name", "Liga")
+    if not home or not away:
+        continue
 
-            match_key = f"{league_id}|{home_team}|{away_team}|{kickoff.isoformat()}"
-
-            matches.append({
-                "match_key": match_key,
-                "league": league_name,
-                "home_team": home_team,
-                "away_team": away_team,
-                "kickoff": kickoff,
-            })
+    matches.append({
+        "match_key": str(fixture.get("id")),
+        "home": home,
+        "away": away,
+        "time": kickoff
+    })
 
     except Exception as exc:
         logger.warning("Error obteniendo próximos partidos: %s", exc)
