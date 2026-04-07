@@ -389,6 +389,7 @@ def build_parley_alert(event: dict, league_name: str) -> dict | None:
 async def fetch_pre_match_alerts(bot: Bot, client: httpx.AsyncClient) -> list[dict]:
     alerts: list[dict] = []
     global odds_credits_alert_sent
+
     now = datetime.now(timezone.utc)
     cutoff = now + timedelta(hours=PRE_MATCH_WINDOW_HOURS)
 
@@ -406,44 +407,38 @@ async def fetch_pre_match_alerts(bot: Bot, client: httpx.AsyncClient) -> list[di
                 timeout=10,
             )
 
-if r.status_code != 200:
-    logger.warning("Odds API %s -> %s | response: %s", sport_key, r.status_code, r.text)
+            if r.status_code != 200:
+                logger.warning("Odds API %s -> %s | response: %s", sport_key, r.status_code, r.text)
 
-    if "OUT_OF_USAGE_CREDITS" in r.text and not odds_credits_alert_sent:
-        try:
-            await bot.send_message(
-                chat_id=CHAT_ID,
-                text="⚠️ Aviso: te quedaste sin créditos en The Odds API."
-            )
-            odds_credits_alert_sent = True
-        except Exception as exc:
-            logger.warning("Error enviando alerta de créditos: %s", exc)
+                if "OUT_OF_USAGE_CREDITS" in r.text and not odds_credits_alert_sent:
+                    try:
+                        await bot.send_message(
+                            chat_id=CHAT_ID,
+                            text="⚠️ Aviso: te quedaste sin créditos en The Odds API."
+                        )
+                        odds_credits_alert_sent = True
+                    except Exception as exc:
+                        logger.warning("Error enviando alerta de créditos: %s", exc)
 
-    await asyncio.sleep(ODDS_API_REQUEST_DELAY)
-    continue
+                await asyncio.sleep(ODDS_API_REQUEST_DELAY)
+                continue
 
-odds_credits_alert_sent = False
+            odds_credits_alert_sent = False
 
             games = r.json()
 
-            # Si no hay partidos en esta liga, sigue
             if not games:
                 logger.info("Sin partidos en %s", sport_key)
                 await asyncio.sleep(ODDS_API_REQUEST_DELAY)
                 continue
-
-            found_upcoming_match = False
 
             for game in games:
                 commence = datetime.fromisoformat(
                     game["commence_time"].replace("Z", "+00:00")
                 )
 
-                # Solo revisar partidos dentro de la ventana
                 if not (now <= commence <= cutoff):
                     continue
-
-                found_upcoming_match = True
 
                 home_team = game.get("home_team")
                 away_team = next(
@@ -497,11 +492,6 @@ odds_credits_alert_sent = False
                             "edge": round(edge * 100, 2),
                             "commence_time": commence,
                         })
-
-            if found_upcoming_match:
-                logger.info("Hay partidos próximos en %s", sport_key)
-            else:
-                logger.info("No hay partidos próximos en %s dentro de %s horas", sport_key, PRE_MATCH_WINDOW_HOURS)
 
             await asyncio.sleep(ODDS_API_REQUEST_DELAY)
 
