@@ -821,14 +821,14 @@ async def main():
                     await asyncio.sleep(sleep_seconds)
                     continue
 
-            upcoming_matches = await fetch_upcoming_matches(client)
+                upcoming_matches = await fetch_upcoming_matches(client)
 
-            for match in upcoming_matches:
-                if match["match_key"] not in sent_upcoming_match_alerts:
-                    text = format_upcoming_match_alert(match)
-                    await bot.send_message(chat_id=CHAT_ID, text=text)
-                    sent_upcoming_match_alerts.add(match["match_key"])
-                  
+                for match in upcoming_matches:
+                    if match["match_key"] not in sent_upcoming_match_alerts:
+                        text = format_upcoming_match_alert(match)
+                        await bot.send_message(chat_id=CHAT_ID, text=text)
+                        sent_upcoming_match_alerts.add(match["match_key"])
+
                 alerts = await fetch_pre_match_alerts(bot, client)
 
                 if alerts:
@@ -840,7 +840,6 @@ async def main():
 
                     sleep_seconds = 60
                     logger.info("Hay partidos cercanos. Revisando en %ds...", sleep_seconds)
-
                 else:
                     sleep_seconds = 1800
                     logger.info("No hay partidos cercanos. Revisando en %ds...", sleep_seconds)
