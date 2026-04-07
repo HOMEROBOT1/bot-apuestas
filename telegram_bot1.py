@@ -23,6 +23,7 @@ from telegram.error import TelegramError
 
 sent_live_signals = set()
 sent_parley_signals = set()
+odds_credits_alert_sent = False
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -385,8 +386,9 @@ def build_parley_alert(event: dict, league_name: str) -> dict | None:
 # ---------------------------------------------------------------------------
 # Data fetchers
 # ---------------------------------------------------------------------------
-async def fetch_pre_match_alerts(client: httpx.AsyncClient) -> list[dict]:
+async def fetch_pre_match_alerts(bot: Bot, client: httpx.AsyncClient) -> list[dict]:
     alerts: list[dict] = []
+    global odds_credits_alert_sent
     now = datetime.now(timezone.utc)
     cutoff = now + timedelta(hours=PRE_MATCH_WINDOW_HOURS)
 
@@ -405,9 +407,22 @@ async def fetch_pre_match_alerts(client: httpx.AsyncClient) -> list[dict]:
             )
 
             if r.status_code != 200:
-                logger.warning("Odds API %s -> %s | response: %s", sport_key, r.status_code, r.text)
-                await asyncio.sleep(ODDS_API_REQUEST_DELAY)
-                continue
+    logger.warning("Odds API %s -> %s | response: %s", sport_key, r.status_code, r.text)
+
+    if "OUT_OF_USAGE_CREDITS" in r.text and not odds_credits_alert_sent:
+        try:
+            await bot.send_message(
+                chat_id=CHAT_ID,
+                text="⚠️ Aviso: te quedaste sin créditos en The Odds API. Las alertas pre-partido quedarán pausadas hasta que se reinicie tu cuota o recargues créditos."
+            )
+            odds_credits_alert_sent = True
+        except Exception as exc:
+            logger.warning("No se pudo enviar alerta de créditos agotados: %s", exc)
+
+    await asyncio.sleep(ODDS_API_REQUEST_DELAY)
+    continue
+
+odds_credits_alert_sent = False
 
             games = r.json()
 
@@ -674,7 +689,10 @@ async def main():
     async with httpx.AsyncClient() as client:
         while True:
             try:
-                alerts = await fetch_pre_match_alerts(client)
+                alerts =
+
+
+              alerts = await fetch_pre_match_alerts(bot, client)
 
                 if alerts:
                     for alert in alerts:
