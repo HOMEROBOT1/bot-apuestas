@@ -638,7 +638,7 @@ async def fetch_upcoming_matches(client: httpx.AsyncClient) -> list[dict]:
 
         data = r.json().get("response", [])
 
-        allowed_league_ids = set(LIVE_LEAGUE_IDS)
+        allowed_league_ids = None
 
         for item in data:
             league = item.get("league", {})
@@ -646,7 +646,7 @@ async def fetch_upcoming_matches(client: httpx.AsyncClient) -> list[dict]:
             teams = item.get("teams", {})
 
             league_id = league.get("id")
-            if league_id not in allowed_league_ids:
+            if allowed_league_ids and league.get("id") not in allowed_league_ids:
                 continue
 
             kickoff_str = fixture.get("date")
