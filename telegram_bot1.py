@@ -718,61 +718,6 @@ def format_pre_match_alert(alert: dict) -> str:
 # Main loop
 # ---------------------------------------------------------------------------
 
-async def run_cycle(bot: Bot, client: httpx.AsyncClient) -> None:
-    logger.info("── Starting new cycle ──────────────────────────────────")
-
-    pre_task = asyncio.create_task(fetch_pre_match_alerts(client))
-    live_task = asyncio.create_task(fetch_live_alerts(client))
-
-    pre_alerts, live_alerts = await asyncio.gather(pre_task, live_task)
-
-    all_alerts = live_alerts + pre_alerts
-
-    qualified = [a for a in all_alerts if passes_score(a)]
-    dropped = len(all_alerts) - len(qualified)
-    if dropped:
-        logger.info("Dropped %d alert(s) below score threshold (%d).", dropped, MIN_SCORE)
-
-    qualified.sort(key=lambda a: -a["score"])
-    selected = qualified[:MAX_ALERTS_PER_CYCLE]
-
-    if not selected:
-        logger.info("No qualifying alerts this cycle.")
-        return
-
-    logger.info(
-        "Sending %d alert(s) — scores: %s",
-        len(selected),
-        [f"{a['type']}={a['score']}/10" for a in selected],
-    )
-
-    for alert in selected:
-        if alert["type"] == "pre_match":
-            text = format_pre_match(alert)
-            await send_message(bot, text)
-
-        elif alert["type"] == "parley":
-            parley_key = make_parley_key(alert)
-            if parley_key in sent_parley_signals:
-                logger.info("🚫 Parley duplicado omitido: %s", parley_key)
-                continue
-
-            text = format_parley(alert)
-            await send_message(bot, text)
-            sent_parley_signals.add(parley_key)
-
-        else:
-            signal_key = make_signal_key(alert)
-            if signal_key in sent_live_signals:
-                logger.info("🚫 Señal duplicada omitida: %s", signal_key)
-                continue
-
-            text = format_live(alert)
-            await send_message(bot, text)
-            sent_live_signals.add(signal_key)
-
-        await asyncio.sleep(1)
-      
 async def fetch_live_alerts(client: httpx.AsyncClient) -> list[dict]:
     alerts: list[dict] = []
 
