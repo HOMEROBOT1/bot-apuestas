@@ -23,7 +23,7 @@ from zoneinfo import ZoneInfo
 # ---------------------------------------------------------------------------
 
 sent_live_signals = set()
-sent_parley_signals = set()
+sent_pre_match_signals = set()
 sent_upcoming_match_alerts = set()
 odds_credits_alert_sent = False
 
@@ -58,22 +58,20 @@ MIN_VALUE_EDGE = 0.06
 # Whitelisted top leagues (Odds API sport keys)
 # ---------------------------------------------------------------------------
 
+CYCLE_INTERVAL = 900
+PRE_MATCH_WINDOW_HOURS = 6
+MAX_ALERTS_PER_CYCLE = 5
+MIN_VALUE_EDGE = 0.06
+
 WHITELISTED_SPORTS = {
     "soccer_epl": "🇬🇧 Premier League",
     "soccer_uefa_champs_league": "🏆 Champions League",
     "soccer_mexico_ligamx": "🇲🇽 Liga MX",
-} 
-ODDS_MARKETS = "h2h"
-ODDS_REGIONS = "uk"
-
-# API-Football competition IDs for live checks (must mirror WHITELISTED_SPORTS)
-LIVE_LEAGUE_IDS = {
-    39,   # Premier League
-    2,    # Champions League
-    262,  # Liga MX
 }
 
-# Delay between consecutive Odds API requests (seconds) to avoid rate limits
+ALLOWED_LEAGUE_IDS = {39, 2, 262}
+ODDS_MARKETS = "h2h"
+ODDS_REGIONS = "uk"
 ODDS_API_REQUEST_DELAY = 60
 
 # ---------------------------------------------------------------------------
@@ -626,31 +624,36 @@ async def fetch_upcoming_matches(client: httpx.AsyncClient) -> list[dict]:
         today_str = now_local.strftime("%Y-%m-%d")
         tomorrow_str = (now_local + timedelta(days=1)).strftime("%Y-%m-%d")
 
-        data = []
-
-        for date_str in [today_str, tomorrow_str]:
-            data = []
-
-            r = await client.get(
-                "https://v3.football.api-sports.io/fixtures",
-                params={
-                    "league": 262,
-                    "season": 2025,
-                    "timezone": "America/Mexico_City"
-                },
-                headers={"x-apisports-key": FOOTBALL_API_KEY},
-                timeout=10,
-            )
-
-            if r.status_code != 200:
-                logger.warning("API-Football error -> %s | %s", r.status_code, r.text)
-                return matches
-
-            response_data = r.json().get("response", [])
-            logger.info("Fixtures Liga MX recibidos: %s", len(response_data))
-            data.extend(response_data)
-
+        data: list[dict] = []
         seen_match_ids = set()
+
+        for league_id in ALLOWED_LEAGUE_IDS:
+            for date_str in [today_str, tomorrow_str]:
+                r = await client.get(
+                    "https://v3.football.api-sports.io/fixtures",
+                    params={
+                        "league": league_id,
+                        "season": 2025,
+                        "date": date_str,
+                        "timezone": "America/Mexico_City",
+                    },
+                    headers={"x-apisports-key": FOOTBALL_API_KEY},
+                    timeout=20,
+                )
+
+                if r.status_code != 200:
+                    logger.warning(
+                        "API-Football fixtures league=%s date=%s -> %s | %s",
+                        league_id, date_str, r.status_code, r.text
+                    )
+                    continue
+
+                response_data = r.json().get("response", [])
+                logger.info(
+                    "Fixtures recibidos league=%s date=%s: %s",
+                    league_id, date_str, len(response_data)
+                )
+                data.extend(response_data)
 
         for item in data:
             league = item.get("league", {})
@@ -663,29 +666,30 @@ async def fetch_upcoming_matches(client: httpx.AsyncClient) -> list[dict]:
             seen_match_ids.add(fixture_id)
 
             status = fixture.get("status", {}).get("short")
+            if status not in ["NS", "TBD"]:
+                continue
+
             kickoff_str = fixture.get("date")
-            home = teams.get("home", {}).get("name")
-            away = teams.get("away", {}).get("name")
-
-            logger.info(
-                "RAW fixture -> liga=%s | home=%s | away=%s | status=%s | date=%s",
-                league.get("name"),
-                home,
-                away,
-                status,
-                kickoff_str,
-            )
-
             if not kickoff_str:
                 continue
 
             kickoff = datetime.fromisoformat(kickoff_str.replace("Z", "+00:00"))
 
+            home = teams.get("home", {}).get("name")
+            away = teams.get("away", {}).get("name")
+            if not home or not away:
+                continue
+
+            logger.info(
+                "Match encontrado: %s vs %s | %s | %s",
+                home, away, league.get("name"), status
+            )
+
             matches.append({
                 "match_key": str(fixture_id),
                 "league": league.get("name", "Liga"),
-                "home_team": home or "Home",
-                "away_team": away or "Away",
+                "home_team": home,
+                "away_team": away,
                 "kickoff": kickoff,
             })
 
@@ -770,14 +774,17 @@ async def run_cycle(bot: Bot, client: httpx.AsyncClient) -> None:
         await asyncio.sleep(1)
       
 async def fetch_live_alerts(client: httpx.AsyncClient) -> list[dict]:
-    alerts = []
+    alerts: list[dict] = []
 
     try:
         r = await client.get(
             "https://v3.football.api-sports.io/fixtures",
-            params={"live": "all"},
+            params={
+                "live": "all",
+                "timezone": "America/Mexico_City",
+            },
             headers={"x-apisports-key": FOOTBALL_API_KEY},
-            timeout=10,
+            timeout=20,
         )
 
         if r.status_code != 200:
@@ -790,21 +797,30 @@ async def fetch_live_alerts(client: httpx.AsyncClient) -> list[dict]:
             fixture = match.get("fixture", {})
             teams = match.get("teams", {})
             goals = match.get("goals", {})
+            league = match.get("league", {})
 
+            league_id = league.get("id")
+            if league_id not in ALLOWED_LEAGUE_IDS:
+                continue
+
+            fixture_id = fixture.get("id")
             home = teams.get("home", {}).get("name")
             away = teams.get("away", {}).get("name")
+            minute = fixture.get("status", {}).get("elapsed", 0)
 
             home_goals = goals.get("home", 0)
             away_goals = goals.get("away", 0)
 
-            minute = fixture.get("status", {}).get("elapsed", 0)
+            if not fixture_id or not home or not away or not minute:
+                continue
 
-            # Ejemplo simple de señal: empate en minuto 70+
-            if minute and minute >= 70 and home_goals == away_goals:
-                signal_key = f"{home}-{away}-{minute}"
+            # ejemplo base: empate 70+
+            if minute >= 70 and home_goals == away_goals:
+                signal_key = f"{fixture_id}_draw70"
 
                 alerts.append({
                     "signal_key": signal_key,
+                    "league": league.get("name", "Liga"),
                     "home": home,
                     "away": away,
                     "minute": minute,
@@ -838,16 +854,11 @@ async def main():
     async with httpx.AsyncClient() as client:
         while True:
             try:
-                upcoming_matches = []
                 now_local = datetime.now(ZoneInfo("America/Mexico_City"))
                 hour = now_local.hour
-                today_str = now_local.strftime("%Y-%m-%d")
-                upcoming_matches = await fetch_upcoming_matches(client)
-                logger.info("Próximos partidos detectados: %s", len(upcoming_matches))
 
                 if hour < 7 or hour >= 22:
                     next_start = now_local.replace(hour=7, minute=0, second=0, microsecond=0)
-
                     if hour >= 22:
                         next_start = next_start + timedelta(days=1)
 
@@ -855,51 +866,44 @@ async def main():
                     logger.info("Fuera de horario. Durmiendo hasta 7:00 AM (%ds).", sleep_seconds)
                     await asyncio.sleep(sleep_seconds)
                     continue
-                    await bot.send_message(chat_id=CHAT_ID, text="✅ Bot activo y prueba OK")
 
-                    upcoming_matches = await fetch_upcoming_matches(client)
-                    logger.info("Próximos partidos detectados: %s", len(upcoming_matches))
+                upcoming_matches = await fetch_upcoming_matches(client)
+                logger.info("Próximos partidos detectados: %s", len(upcoming_matches))
 
                 for match in upcoming_matches:
-                    logger.info("Intentando enviar: %s vs %s", match["home_team"], match["away_team"])
-
                     if match["match_key"] not in sent_upcoming_match_alerts:
+                        logger.info("Intentando enviar próximo partido: %s vs %s", match["home_team"], match["away_team"])
                         text = format_upcoming_match_alert(match)
                         await bot.send_message(chat_id=CHAT_ID, text=text)
                         sent_upcoming_match_alerts.add(match["match_key"])
 
                 alerts = await fetch_pre_match_alerts(bot, client)
 
-                if alerts:
-                    for alert in alerts:
-                        if alert["match_key"] not in sent_parley_signals:
-                            text = format_pre_match_alert(alert)
-                            await bot.send_message(chat_id=CHAT_ID, text=text)
-                            sent_parley_signals.add(alert["match_key"])
+                for alert in alerts:
+                    if alert["match_key"] not in sent_pre_match_signals:
+                        logger.info("Intentando enviar pre-partido: %s vs %s", alert["home_team"], alert["away_team"])
+                        text = format_pre_match_alert(alert)
+                        await bot.send_message(chat_id=CHAT_ID, text=text)
+                        sent_pre_match_signals.add(alert["match_key"])
 
-                if upcoming_matches:
-                    sleep_seconds = 60
-                    logger.info("Hay partidos programados hoy. Revisando en %ds...", sleep_seconds)
-                else:
-                    sleep_seconds = 60
-                    logger.info("No hay partidos próximos. Pero sigo revisando en vivo cada %ds...", sleep_seconds)
+                live_alerts = await fetch_live_alerts(client)
 
-                try:
-                    live_alerts = await fetch_live_alerts(client)
-                    for alert in live_alerts:
-                        if alert["signal_key"] not in sent_live_signals:
-                            text = format_live_alert(alert)
-                            await bot.send_message(chat_id=CHAT_ID, text=text)
-                            sent_live_signals.add(alert["signal_key"])
-                except Exception as exc:
-                    logger.warning("Live alerts error: %s", exc)
+                for alert in live_alerts:
+                    if alert["signal_key"] not in sent_live_signals:
+                        logger.info("Intentando enviar en vivo: %s vs %s", alert["home"], alert["away"])
+                        text = format_live_alert(alert)
+                        await bot.send_message(chat_id=CHAT_ID, text=text)
+                        sent_live_signals.add(alert["signal_key"])
+
+                sleep_seconds = 60
+                logger.info("Sleeping %ds until next cycle...", sleep_seconds)
+                await asyncio.sleep(sleep_seconds)
 
             except Exception as exc:
                 logger.error("Cycle error: %s", exc)
                 sleep_seconds = CYCLE_INTERVAL
-
-            logger.info("Sleeping %ds until next cycle...", sleep_seconds)
-            await asyncio.sleep(sleep_seconds)
+                logger.info("Sleeping %ds until next cycle...", sleep_seconds)
+                await asyncio.sleep(sleep_seconds)
 
 
 
