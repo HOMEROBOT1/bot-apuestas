@@ -2,16 +2,14 @@
 Football Betting Alerts Bot
 ----------------------------
 Data sources:
-  - The Odds API  (https://the-odds-api.com)  → pre-match odds
-  - API-Football  (https://api-sports.io)      → live match scores / events
+  - The Odds API  -> pre-match odds
+  - API-Football  -> live fixtures / scores
 """
 
 import asyncio
 import logging
-import os
 from datetime import datetime, timezone, timedelta
 from statistics import mean
-import re
 
 import httpx
 from telegram import Bot
@@ -36,32 +34,36 @@ ODDS_API_KEY = "92f3a8c48fe9834c7b1e6bbf38346064"
 FOOTBALL_API_KEY = "c455630d0023ef208f93dd0567164905"
 CHAT_ID = "1983622390"
 
-PRE_MATCH_WINDOW_HOURS = 24
+LOCAL_TZ = ZoneInfo("America/Mexico_City")
 
-print("DEBUG BOT_TOKEN TYPE:", type(BOT_TOKEN), BOT_TOKEN)
-print("DEBUG ODDS_API_KEY TYPE:", type(ODDS_API_KEY), ODDS_API_KEY)
-print("DEBUG FOOTBALL_API_KEY TYPE:", type(FOOTBALL_API_KEY), FOOTBALL_API_KEY)
-print("DEBUG CHAT_ID TYPE:", type(CHAT_ID), CHAT_ID)
-# How often to run a full cycle (seconds)
-CYCLE_INTERVAL = 900   # 15 minutes
+# Ciclos
+PREMATCH_SCAN_INTERVAL = 180   # 3 min
+LIVE_SCAN_INTERVAL = 60        # 1 min
+UPCOMING_SCAN_INTERVAL = 300   # 5 min
+MAIN_LOOP_SLEEP = 60           # 1 min
 
-# How far ahead to look for upcoming matches (hours)
-PRE_MATCH_WINDOW_HOURS = 6
+# Ventana pre-match
+PREMATCH_MIN_MINUTES = 15
+PREMATCH_MAX_MINUTES = 120
 
-# Maximum alerts to send per cycle
-MAX_ALERTS_PER_CYCLE = 5
+# Próximos partidos informativos
+UPCOMING_LOOKAHEAD_HOURS = 12
 
-# Minimum value edge to flag a bet (e.g. 0.06 = 6 % edge over fair odds)
-MIN_VALUE_EDGE = 0.06
+# Filtro de valor
+MIN_VALUE_EDGE = 0.06  # 6%
+
+# Límites
+MAX_PREMATCH_ALERTS_PER_CYCLE = 5
+MAX_LIVE_ALERTS_PER_CYCLE = 5
+
+# Odds API
+ODDS_MARKETS = "h2h"
+ODDS_REGIONS = "uk"
+ODDS_API_REQUEST_DELAY = 1
 
 # ---------------------------------------------------------------------------
-# Whitelisted top leagues (Odds API sport keys)
+# Whitelisted leagues
 # ---------------------------------------------------------------------------
-
-CYCLE_INTERVAL = 900
-PRE_MATCH_WINDOW_HOURS = 6
-MAX_ALERTS_PER_CYCLE = 5
-MIN_VALUE_EDGE = 0.06
 
 WHITELISTED_SPORTS = {
     "soccer_epl": "🇬🇧 Premier League",
@@ -70,9 +72,6 @@ WHITELISTED_SPORTS = {
 }
 
 ALLOWED_LEAGUE_IDS = {39, 2, 262}
-ODDS_MARKETS = "h2h"
-ODDS_REGIONS = "uk"
-ODDS_API_REQUEST_DELAY = 60
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -85,509 +84,125 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Confidence scoring
-# ---------------------------------------------------------------------------
-
-MIN_SCORE = 7
-
-
-def score_badge(score: int) -> str:
-    if score >= 9:
-        return "🟢"
-    if score >= 7:
-        return "🟡"
-    return "🔴"
-
-
-def score_pre_match(edge: float, book_count: int) -> int:
-    pct = edge * 100
-    if pct >= 18:
-        base = 9
-    elif pct >= 15:
-        base = 8
-    elif pct >= 12:
-        base = 7
-    elif pct >= 10:
-        base = 6
-    elif pct >= 8:
-        base = 5
-    else:
-        base = 4
-
-    if book_count >= 8:
-        mod = 2
-    elif book_count >= 6:
-        mod = 1
-    elif book_count < 4:
-        mod = -1
-    else:
-        mod = 0
-
-    return max(1, min(10, base + mod))
-
-
-def score_live(priority: int, minute: int) -> int:
-    if priority == 3:
-        if minute >= 85:
-            return 9
-        if minute >= 75:
-            return 8
-        return 7
-
-    if priority == 2:
-        if minute >= 85:
-            return 8
-        if minute >= 75:
-            return 7
-        return 6
-
-    if minute >= 80:
-        return 7
-    if minute >= 75:
-        return 6
-    return 4
-
-
-def passes_score(alert: dict) -> bool:
-    return alert["score"] >= MIN_SCORE
-
-
-def suggested_stake(score: int) -> str:
-    if score >= 9:
-        return "3% of bankroll"
-    if score >= 8:
-        return "2% of bankroll"
-    return "1% of bankroll"
-
-
-# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def odds_to_prob(odds: float) -> float:
-    return 1.0 / odds if odds > 0 else 0.0
+def now_local() -> datetime:
+    return datetime.now(LOCAL_TZ)
 
 
-def overround(probs: list[float]) -> float:
-    return sum(probs) - 1.0
+def utc_to_local(dt: datetime) -> datetime:
+    return dt.astimezone(LOCAL_TZ)
 
 
-def best_value_outcome(bookmakers: list[dict]) -> dict | None:
-    prices: dict[str, list[float]] = {"Home": [], "Draw": [], "Away": []}
-
-    for bm in bookmakers:
-        for market in bm.get("markets", []):
-            if market["key"] != "h2h":
-                continue
-            for outcome in market["outcomes"]:
-                name = outcome["name"]
-                price = outcome["price"]
-                if name in prices:
-                    prices[name].append(price)
-
-    if not all(prices.values()):
-        return None
-
-    fair_probs: dict[str, float] = {}
-    for outcome, odds_list in prices.items():
-        raw_probs = [odds_to_prob(o) for o in odds_list]
-        total_overround = overround(
-            [odds_to_prob(o) for o in [mean(prices[k]) for k in prices]]
-        )
-        share = mean(raw_probs) / (1.0 + total_overround)
-        fair_probs[outcome] = min(share, 0.99)
-
-    best_outcome = None
-    best_edge = MIN_VALUE_EDGE
-
-    for outcome, odds_list in prices.items():
-        best_odds = max(odds_list)
-        implied = odds_to_prob(best_odds)
-        fair = fair_probs[outcome]
-        edge = fair - implied
-        if edge > best_edge:
-            best_edge = edge
-            best_outcome = {
-                "label": outcome,
-                "best_odds": best_odds,
-                "fair_prob": fair,
-                "edge": edge,
-                "book_count": len(odds_list),
-            }
-
-    return best_outcome
+def parse_iso_datetime(iso_str: str) -> datetime:
+    return datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
 
 
-def format_kickoff(iso_str: str) -> str:
-    dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-    local = dt.astimezone()
-    return local.strftime("%H:%M")
+def format_local_hour(dt: datetime) -> str:
+    return utc_to_local(dt).strftime("%I:%M %p").lstrip("0")
 
 
-def traducir_signal(reason: str) -> str:
-    if "comeback / Draw" in reason:
-        return "Apostar a que el equipo local empata o remonta"
-    elif "Over" in reason:
-        return "Se esperan más goles en el partido"
-    elif "Next goal" in reason:
-        return "Próximo gol del equipo indicado"
-    elif "lead by 1" in reason:
-        return "El equipo visitante va ganando por 1 gol"
-    else:
-        return reason
+def get_minutes_to_start(commence_time: datetime) -> int:
+    diff = commence_time - datetime.now(timezone.utc)
+    return int(diff.total_seconds() // 60)
 
 
-def normalize_reason(reason: str) -> str:
-    reason = reason.strip().lower()
-    reason = re.sub(r"at\s+\d{1,3}'?", "", reason)
-    reason = re.sub(r"\s+", " ", reason).strip()
-    return reason
+def should_send_prematch(commence_time: datetime) -> bool:
+    minutes_to_start = get_minutes_to_start(commence_time)
+    return PREMATCH_MIN_MINUTES <= minutes_to_start <= PREMATCH_MAX_MINUTES
 
 
-def make_signal_key(alert: dict) -> str:
-    home = alert["home"].strip().lower()
-    away = alert["away"].strip().lower()
-    league = alert["league"].strip().lower()
-    reason = normalize_reason(alert["reason"])
-    return f"{league}|{home}|{away}|{reason}"
+def normalize_text(value: str) -> str:
+    return (value or "").strip().lower()
 
 
-def make_parley_key(alert: dict) -> str:
-    league = alert["league"].strip().lower()
-    home = alert["home"].strip().lower()
-    away = alert["away"].strip().lower()
-    legs = "|".join(leg["label"].strip().lower() for leg in alert["legs"])
-    return f"{league}|{home}|{away}|{legs}"
+def get_match_teams_from_odds_event(game: dict) -> tuple[str, str]:
+    home_team = game.get("home_team") or "Local"
+    away_team = game.get("away_team")
+
+    if away_team:
+        return home_team, away_team
+
+    teams = game.get("teams", [])
+    for team in teams:
+        if team != home_team:
+            return home_team, team
+
+    return home_team, "Visitante"
+
+
+def build_prematch_key(sport_key: str, home_team: str, away_team: str, pick: str) -> str:
+    return f"{normalize_text(sport_key)}|{normalize_text(home_team)}|{normalize_text(away_team)}|{normalize_text(pick)}"
+
+
+def build_upcoming_key(match_id: str) -> str:
+    return str(match_id)
+
+
+def build_live_key(fixture_id: int, minute: int, signal_type: str) -> str:
+    minute_bucket = minute // 5
+    return f"{fixture_id}|{minute_bucket}|{normalize_text(signal_type)}"
+
+
+def implied_probability(decimal_odds: float) -> float:
+    if not decimal_odds or decimal_odds <= 1:
+        return 0.0
+    return 1 / decimal_odds
+
+
+def translate_pick(team_name: str, home_team: str, away_team: str) -> str:
+    if team_name == home_team:
+        return f"Gana {home_team}"
+    if team_name == away_team:
+        return f"Gana {away_team}"
+    if normalize_text(team_name) == "draw":
+        return "Empate"
+    return team_name
+
+
+def safe_send_text(bot: Bot, text: str, parse_mode: str | None = None) -> None:
+    # helper placeholder if luego quieres centralizar más cosas
+    return
 
 
 # ---------------------------------------------------------------------------
-# Parley helpers
+# Formatting
 # ---------------------------------------------------------------------------
 
-def extract_parley_legs(bookmaker: dict) -> list[dict]:
-    legs: list[dict] = []
-
-    for market in bookmaker.get("markets", []):
-        key = market.get("key")
-        outcomes = market.get("outcomes", [])
-
-        if key == "h2h":
-            valid = []
-            for o in outcomes:
-                price = o.get("price")
-                name = o.get("name")
-                if (
-                    name
-                    and isinstance(price, (int, float))
-                    and 1.45 <= price <= 1.95
-                ):
-                    valid.append({
-                        "type": "winner",
-                        "label": f"Gana {name}",
-                        "odds": price,
-                    })
-
-            if valid:
-                valid.sort(key=lambda x: x["odds"])
-                legs.append(valid[0])
-
-        elif key == "totals":
-            valid = []
-            for o in outcomes:
-                name = str(o.get("name", "")).lower()
-                point = o.get("point")
-                price = o.get("price")
-
-                if (
-                    name == "over"
-                    and point in (1.5, 2.5)
-                    and isinstance(price, (int, float))
-                    and 1.55 <= price <= 2.10
-                ):
-                    valid.append({
-                        "type": "goals",
-                        "label": f"Más de {point} goles",
-                        "odds": price,
-                        "point": point,
-                    })
-
-            if valid:
-                valid.sort(key=lambda x: x["point"])
-                legs.append(valid[0])
-
-        elif key == "btts":
-            for o in outcomes:
-                name = str(o.get("name", "")).lower()
-                price = o.get("price")
-
-                if (
-                    name in ("yes", "si", "sí")
-                    and isinstance(price, (int, float))
-                    and 1.60 <= price <= 2.05
-                ):
-                    legs.append({
-                        "type": "btts",
-                        "label": "Ambos anotan",
-                        "odds": price,
-                    })
-                    break
-
-    return legs
-
-
-def build_parley_alert(event: dict, league_name: str) -> dict | None:
-    home = event.get("home_team", "Local")
-    away = event.get("away_team", "Visitante")
-    kickoff_iso = event.get("commence_time", "")
-    bookmakers = event.get("bookmakers", [])
-
-    if not bookmakers:
-        return None
-
-    bookmaker = bookmakers[0]
-    extracted = extract_parley_legs(bookmaker)
-
-    winner_leg = next((x for x in extracted if x["type"] == "winner"), None)
-    goals_leg = next((x for x in extracted if x["type"] == "goals"), None)
-    btts_leg = next((x for x in extracted if x["type"] == "btts"), None)
-
-    selected_legs = None
-
-    if winner_leg and goals_leg:
-        selected_legs = [winner_leg, goals_leg]
-    elif btts_leg and goals_leg:
-        selected_legs = [btts_leg, goals_leg]
-
-    if not selected_legs:
-        return None
-
-    combined_odds = 1.0
-    for leg in selected_legs:
-        combined_odds *= leg["odds"]
-
-    combined_odds = round(combined_odds, 2)
-
-    if not (2.00 <= combined_odds <= 4.50):
-        return None
-
-    return {
-        "type": "parley",
-        "score": 8,
-        "league": league_name,
-        "home": home,
-        "away": away,
-        "match": f"{home} vs {away}",
-        "kickoff": format_kickoff(kickoff_iso) if kickoff_iso else "",
-        "legs": selected_legs,
-        "combined_odds": combined_odds,
-        "book_count": len(bookmakers),
-        "event_id": event.get("id", f"{home}_{away}_{kickoff_iso}"),
-    }
-
-
-# ---------------------------------------------------------------------------
-# Data fetchers
-# ---------------------------------------------------------------------------
-async def fetch_pre_match_alerts(bot: Bot, client: httpx.AsyncClient) -> list[dict]:
-    alerts: list[dict] = []
-    global odds_credits_alert_sent
-
-    now = datetime.now(timezone.utc)
-    cutoff = now + timedelta(hours=PRE_MATCH_WINDOW_HOURS)
-
-    for sport_key, league_name in WHITELISTED_SPORTS.items():
-        try:
-            r = await client.get(
-                f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/",
-                params={
-                    "apiKey": ODDS_API_KEY,
-                    "regions": ODDS_REGIONS,
-                    "markets": ODDS_MARKETS,
-                    "oddsFormat": "decimal",
-                    "dateFormat": "iso",
-                },
-                timeout=10,
-            )
-
-            if r.status_code != 200:
-                logger.warning("Odds API %s -> %s | response: %s", sport_key, r.status_code, r.text)
-
-                if "OUT_OF_USAGE_CREDITS" in r.text and not odds_credits_alert_sent:
-                    try:
-                        await bot.send_message(
-                            chat_id=CHAT_ID,
-                            text="⚠️ Aviso: te quedaste sin créditos en The Odds API."
-                        )
-                        odds_credits_alert_sent = True
-                    except Exception as exc:
-                        logger.warning("Error enviando alerta de créditos: %s", exc)
-
-                await asyncio.sleep(ODDS_API_REQUEST_DELAY)
-                continue
-
-            odds_credits_alert_sent = False
-            games = r.json()
-
-            if not games:
-                logger.info("Sin partidos en %s", sport_key)
-                await asyncio.sleep(ODDS_API_REQUEST_DELAY)
-                continue
-
-            for game in games:
-                commence = datetime.fromisoformat(
-                    game["commence_time"].replace("Z", "+00:00")
-                )
-
-                if not (-7200 <= (commence - now).total_seconds() <= PRE_MATCH_WINDOW_HOURS * 3600):
-                    continue
-
-                home_team = game.get("home_team")
-                away_team = next(
-                    (t for t in game.get("teams", []) if t != home_team),
-                    "Away"
-                )
-
-                bookmakers = game.get("bookmakers", [])
-                if not bookmakers:
-                    continue
-
-                outcomes_by_team: dict[str, list[float]] = {}
-
-                for bookmaker in bookmakers:
-                    for market in bookmaker.get("markets", []):
-                        if market.get("key") != "h2h":
-                            continue
-                        for outcome in market.get("outcomes", []):
-                            name = outcome.get("name")
-                            price = outcome.get("price")
-                            if name and isinstance(price, (int, float)):
-                                outcomes_by_team.setdefault(name, []).append(float(price))
-
-                if not outcomes_by_team:
-                    continue
-
-                for team_name, prices in outcomes_by_team.items():
-                    if len(prices) < 2:
-                        continue
-
-                    best_odds = max(prices)
-                    avg_odds = mean(prices)
-
-                    if avg_odds <= 1:
-                        continue
-
-                    fair_prob = 1 / avg_odds
-                    implied_prob_best = 1 / best_odds
-                    edge = fair_prob - implied_prob_best
-
-                    if edge >= MIN_VALUE_EDGE:
-                        match_key = f"{sport_key}|{home_team}|{away_team}|{team_name}"
-                        alerts.append({
-                            "match_key": match_key,
-                            "league": league_name,
-                            "home_team": home_team,
-                            "away_team": away_team,
-                            "pick": team_name,
-                            "best_odds": round(best_odds, 2),
-                            "avg_odds": round(avg_odds, 2),
-                            "edge": round(edge * 100, 2),
-                            "commence_time": commence,
-                        })
-
-            await asyncio.sleep(ODDS_API_REQUEST_DELAY)
-
-        except Exception as exc:
-            logger.warning("Error consultando %s: %s", sport_key, exc)
-            await asyncio.sleep(ODDS_API_REQUEST_DELAY)
-            continue
-
-    return alerts
-
-
-
-# ---------------------------------------------------------------------------
-# Message formatting
-# ---------------------------------------------------------------------------
-
-DIV = "━━━━━━━━━━━━━━━━"
-
-
-def format_pre_match(alert: dict) -> str:
-    edge_pct = round(alert["edge"] * 100, 1)
-    fair_pct = round(alert["fair_prob"] * 100, 1)
-    mins = alert["minutes_to_ko"]
-    time_str = f"{mins}m" if mins < 60 else f"{mins // 60}h {mins % 60}m"
-    s = alert["score"]
-
-    header = "💎 *VIP SIGNAL*" if s >= 8 else "📊 *BETTING SIGNAL*"
-
-    return "\n".join([
-        header,
-        f"{DIV}",
-        f"{alert['league']}",
-        f"🕐  Pre-Match  ·  In {time_str}  ·  {alert['kickoff']}",
-        "",
-        f"*{alert['home']}*  vs  *{alert['away']}*",
-        f"{DIV}",
-        f"✅  *PICK:  {alert['outcome'].upper()}*",
-        f"💰  Odds:   `{alert['odds']}`",
-        f"📈  Edge:   *+{edge_pct}%*   ·   Fair:  {fair_pct}%",
-        f"📚  Books:  {alert['book_count']} bookmakers",
-        f"{DIV}",
-        f"🎯  Confidence:  *{s} / 10*",
-        f"💵  Stake:       *{suggested_stake(s)}*",
-        f"{DIV}",
-    ])
-
-
-def format_parley(alert: dict) -> str:
-    s = alert["score"]
-    header = "💎 *VIP PARLEY*" if s >= 8 else "🔥 *PARLEY SUGERIDO*"
-
-    legs_text = "\n".join(
-        [f"• {leg['label']} @ `{leg['odds']}`" for leg in alert["legs"]]
+def format_upcoming_match_alert(match: dict) -> str:
+    return (
+        f"📅 PRÓXIMO PARTIDO\n\n"
+        f"⚽ {match['home_team']} vs {match['away_team']}\n"
+        f"🏆 Liga: {match['league']}\n"
+        f"🕒 Hora: {format_local_hour(match['kickoff'])}"
     )
 
-    return "\n".join([
-        header,
-        f"{DIV}",
-        f"{alert['league']}",
-        f"🕐  Pre-Match  ·  {alert['kickoff']}" if alert.get("kickoff") else "🕐  Pre-Match",
-        "",
-        f"*{alert['home']}*  vs  *{alert['away']}*",
-        f"{DIV}",
-        "🎯 *SELECCIONES:*",
-        legs_text,
-        f"{DIV}",
-        f"💰 *Cuota total:* `{alert['combined_odds']}`",
-        f"📚 Books: {alert.get('book_count', 0)} bookmakers",
-        f"🎯 Confianza: *{s} / 10*",
-        f"💵 Stake: *{suggested_stake(s)}*",
-        f"{DIV}",
-    ])
+
+def format_pre_match_alert(alert: dict) -> str:
+    return (
+        f"📊 ALERTA PRE-PARTIDO\n\n"
+        f"⚽ {alert['home_team']} vs {alert['away_team']}\n"
+        f"🏆 Liga: {alert['league']}\n"
+        f"🎯 Pick: {alert['pick_text']}\n"
+        f"💰 Mejor cuota: {alert['best_odds']:.2f}\n"
+        f"📉 Cuota promedio: {alert['avg_odds']:.2f}\n"
+        f"🔥 Edge: {alert['edge_pct']:.2f}%\n"
+        f"⏳ Faltan: {alert['minutes_to_start']} min\n"
+        f"🕒 Hora: {format_local_hour(alert['commence_time'])}"
+    )
 
 
-def format_live(alert: dict) -> str:
-    s = alert["score"]
-    home, away = alert["home"], alert["away"]
-    sh, sa = alert["score_str"].split("-")
-
-    header = "💎 *SEÑAL VIP EN VIVO*" if s >= 8 else "🔴 *SEÑAL EN VIVO*"
-
-    return "\n".join([
-        header,
-        f"{DIV}",
-        f"{alert['league']}",
-        f"⏱  *{alert['minute']}'*  ·  In Play",
-        "",
-        f"*{home}*   {sh} — {sa}   *{away}*",
-        f"{DIV}",
-        f"✅ *SEÑAL:* {traducir_signal(alert['reason'])}",
-        f"{DIV}",
-        f"🎯 Confianza: *{s} / 10*",
-        f"💵 Apuesta: *{suggested_stake(s)}*",
-        f"{DIV}",
-    ])
+def format_live_alert(alert: dict) -> str:
+    return (
+        f"🔥 ALERTA EN VIVO\n\n"
+        f"⚽ {alert['home']} vs {alert['away']}\n"
+        f"🏆 Liga: {alert['league']}\n"
+        f"📊 Marcador: {alert['score']}\n"
+        f"⏱ Minuto: {alert['minute']}\n"
+        f"🎯 Señal: {alert['signal_type']}\n"
+        f"📌 Motivo: {alert['reason']}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -599,36 +214,31 @@ async def send_message(bot: Bot, text: str) -> None:
         await bot.send_message(
             chat_id=CHAT_ID,
             text=text,
-            parse_mode="Markdown",
         )
-        logger.info("Sent alert (%d chars)", len(text))
+        logger.info("Mensaje enviado (%d chars)", len(text))
     except TelegramError as exc:
         logger.error("Telegram error: %s", exc)
 
-def format_upcoming_match_alert(match: dict) -> str:
-    local_time = match["kickoff"].astimezone()
-    hour_text = local_time.strftime("%I:%M %p").lstrip("0")
 
-    return (
-        f"📅 PRÓXIMO PARTIDO\n\n"
-        f"{match['home_team']} vs {match['away_team']}\n"
-        f"Liga: {match['league']}\n"
-        f"Hora: {hour_text}"
-    )
-  
+# ---------------------------------------------------------------------------
+# Upcoming matches
+# ---------------------------------------------------------------------------
+
 async def fetch_upcoming_matches(client: httpx.AsyncClient) -> list[dict]:
     matches: list[dict] = []
 
     try:
-        now_local = datetime.now(ZoneInfo("America/Mexico_City"))
-        today_str = now_local.strftime("%Y-%m-%d")
-        tomorrow_str = (now_local + timedelta(days=1)).strftime("%Y-%m-%d")
+        now_mx = now_local()
+        end_time = now_mx + timedelta(hours=UPCOMING_LOOKAHEAD_HOURS)
 
-        data: list[dict] = []
         seen_match_ids = set()
+        dates_to_check = {
+            now_mx.strftime("%Y-%m-%d"),
+            end_time.strftime("%Y-%m-%d"),
+        }
 
         for league_id in ALLOWED_LEAGUE_IDS:
-            for date_str in [today_str, tomorrow_str]:
+            for date_str in sorted(dates_to_check):
                 r = await client.get(
                     "https://v3.football.api-sports.io/fixtures",
                     params={
@@ -649,73 +259,177 @@ async def fetch_upcoming_matches(client: httpx.AsyncClient) -> list[dict]:
                     continue
 
                 response_data = r.json().get("response", [])
-                logger.info(
-                    "Fixtures recibidos league=%s date=%s: %s",
-                    league_id, date_str, len(response_data)
-                )
-                data.extend(response_data)
 
-        for item in data:
-            league = item.get("league", {})
-            fixture = item.get("fixture", {})
-            teams = item.get("teams", {})
+                for item in response_data:
+                    league = item.get("league", {})
+                    fixture = item.get("fixture", {})
+                    teams = item.get("teams", {})
 
-            fixture_id = fixture.get("id")
-            if not fixture_id or fixture_id in seen_match_ids:
-                continue
-            seen_match_ids.add(fixture_id)
+                    fixture_id = fixture.get("id")
+                    if not fixture_id or fixture_id in seen_match_ids:
+                        continue
+                    seen_match_ids.add(fixture_id)
 
-            status = fixture.get("status", {}).get("short")
-            if status not in ["NS", "TBD"]:
-                continue
+                    status = fixture.get("status", {}).get("short")
+                    if status not in {"NS", "TBD"}:
+                        continue
 
-            kickoff_str = fixture.get("date")
-            if not kickoff_str:
-                continue
+                    kickoff_str = fixture.get("date")
+                    if not kickoff_str:
+                        continue
 
-            kickoff = datetime.fromisoformat(kickoff_str.replace("Z", "+00:00"))
+                    kickoff = parse_iso_datetime(kickoff_str)
+                    kickoff_local = utc_to_local(kickoff)
 
-            home = teams.get("home", {}).get("name")
-            away = teams.get("away", {}).get("name")
-            if not home or not away:
-                continue
+                    if not (now_mx <= kickoff_local <= end_time):
+                        continue
 
-            logger.info(
-                "Match encontrado: %s vs %s | %s | %s",
-                home, away, league.get("name"), status
-            )
+                    home = teams.get("home", {}).get("name")
+                    away = teams.get("away", {}).get("name")
+                    if not home or not away:
+                        continue
 
-            matches.append({
-                "match_key": str(fixture_id),
-                "league": league.get("name", "Liga"),
-                "home_team": home,
-                "away_team": away,
-                "kickoff": kickoff,
-            })
-
-        logger.info("Próximos partidos finales: %s", len(matches))
-        return matches
+                    matches.append({
+                        "match_key": build_upcoming_key(fixture_id),
+                        "league": league.get("name", "Liga"),
+                        "home_team": home,
+                        "away_team": away,
+                        "kickoff": kickoff,
+                    })
 
     except Exception as exc:
         logger.warning("Error obteniendo próximos partidos: %s", exc)
-        return matches
-  
-def format_pre_match_alert(alert: dict) -> str:
-    local_time = alert["commence_time"].astimezone()
-    hour_text = local_time.strftime("%I:%M %p").lstrip("0")
 
-    return (
-        f"📊 ALERTA PRE-PARTIDO\n\n"
-        f"{alert['home_team']} vs {alert['away_team']}\n"
-        f"Liga: {alert['league']}\n"
-        f"Pick: {alert['pick']}\n"
-        f"Mejor cuota: {alert['best_odds']}\n"
-        f"Cuota promedio: {alert['avg_odds']}\n"
-        f"Edge: {alert['edge']}%\n"
-        f"Hora: {hour_text}"
-    )
+    return matches
+
+
 # ---------------------------------------------------------------------------
-# Main loop
+# Pre-match alerts
+# ---------------------------------------------------------------------------
+
+async def fetch_pre_match_alerts(bot: Bot, client: httpx.AsyncClient) -> list[dict]:
+    alerts: list[dict] = []
+    global odds_credits_alert_sent
+
+    for sport_key, league_name in WHITELISTED_SPORTS.items():
+        try:
+            r = await client.get(
+                f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/",
+                params={
+                    "apiKey": ODDS_API_KEY,
+                    "regions": ODDS_REGIONS,
+                    "markets": ODDS_MARKETS,
+                    "oddsFormat": "decimal",
+                    "dateFormat": "iso",
+                },
+                timeout=15,
+            )
+
+            if r.status_code != 200:
+                logger.warning("Odds API %s -> %s | %s", sport_key, r.status_code, r.text)
+
+                if "OUT_OF_USAGE_CREDITS" in r.text and not odds_credits_alert_sent:
+                    try:
+                        await send_message(
+                            bot,
+                            "⚠️ Aviso: te quedaste sin créditos en The Odds API."
+                        )
+                        odds_credits_alert_sent = True
+                    except Exception as exc:
+                        logger.warning("No se pudo enviar alerta de créditos: %s", exc)
+
+                await asyncio.sleep(ODDS_API_REQUEST_DELAY)
+                continue
+
+            odds_credits_alert_sent = False
+            games = r.json()
+
+            for game in games:
+                commence_time_raw = game.get("commence_time")
+                if not commence_time_raw:
+                    continue
+
+                commence_time = parse_iso_datetime(commence_time_raw)
+
+                # filtro PRO: solo 15 a 120 min antes
+                if not should_send_prematch(commence_time):
+                    continue
+
+                home_team, away_team = get_match_teams_from_odds_event(game)
+                bookmakers = game.get("bookmakers", [])
+
+                if not bookmakers:
+                    continue
+
+                outcomes_by_name: dict[str, list[float]] = {}
+
+                for bookmaker in bookmakers:
+                    for market in bookmaker.get("markets", []):
+                        if market.get("key") != "h2h":
+                            continue
+
+                        for outcome in market.get("outcomes", []):
+                            name = outcome.get("name")
+                            price = outcome.get("price")
+
+                            if not name or not isinstance(price, (int, float)):
+                                continue
+
+                            outcomes_by_name.setdefault(name, []).append(float(price))
+
+                if not outcomes_by_name:
+                    continue
+
+                for outcome_name, prices in outcomes_by_name.items():
+                    if len(prices) < 2:
+                        continue
+
+                    best_odds = max(prices)
+                    avg_odds = mean(prices)
+
+                    if avg_odds <= 1 or best_odds <= 1:
+                        continue
+
+                    fair_prob = implied_probability(avg_odds)
+                    best_implied_prob = implied_probability(best_odds)
+                    edge_decimal = fair_prob - best_implied_prob
+
+                    if edge_decimal < MIN_VALUE_EDGE:
+                        continue
+
+                    match_key = build_prematch_key(
+                        sport_key=sport_key,
+                        home_team=home_team,
+                        away_team=away_team,
+                        pick=outcome_name,
+                    )
+
+                    alerts.append({
+                        "match_key": match_key,
+                        "league": league_name,
+                        "home_team": home_team,
+                        "away_team": away_team,
+                        "pick": outcome_name,
+                        "pick_text": translate_pick(outcome_name, home_team, away_team),
+                        "best_odds": float(best_odds),
+                        "avg_odds": float(avg_odds),
+                        "edge_pct": edge_decimal * 100,
+                        "minutes_to_start": get_minutes_to_start(commence_time),
+                        "commence_time": commence_time,
+                    })
+
+            await asyncio.sleep(ODDS_API_REQUEST_DELAY)
+
+        except Exception as exc:
+            logger.warning("Error consultando %s: %s", sport_key, exc)
+            await asyncio.sleep(ODDS_API_REQUEST_DELAY)
+
+    alerts.sort(key=lambda x: (-x["edge_pct"], x["minutes_to_start"]))
+    return alerts[:MAX_PREMATCH_ALERTS_PER_CYCLE]
+
+
+# ---------------------------------------------------------------------------
+# Live alerts
 # ---------------------------------------------------------------------------
 
 async def fetch_live_alerts(client: httpx.AsyncClient) -> list[dict]:
@@ -759,97 +473,140 @@ async def fetch_live_alerts(client: httpx.AsyncClient) -> list[dict]:
             if not fixture_id or not home or not away or not minute:
                 continue
 
-            # ejemplo base: empate 70+
+            # Señal 1: empate minuto 70+
             if minute >= 70 and home_goals == away_goals:
-                signal_key = f"{fixture_id}_draw70"
-
                 alerts.append({
-                    "signal_key": signal_key,
+                    "signal_key": build_live_key(fixture_id, minute, "empate_70+"),
                     "league": league.get("name", "Liga"),
                     "home": home,
                     "away": away,
                     "minute": minute,
                     "score": f"{home_goals}-{away_goals}",
+                    "signal_type": "Empate tardío",
+                    "reason": "Partido empatado en minuto avanzado, puede abrirse al final.",
+                })
+
+            # Señal 2: gana visitante por 1 gol en 75+
+            if minute >= 75 and away_goals - home_goals == 1:
+                alerts.append({
+                    "signal_key": build_live_key(fixture_id, minute, "visitante_gana_por_1"),
+                    "league": league.get("name", "Liga"),
+                    "home": home,
+                    "away": away,
+                    "minute": minute,
+                    "score": f"{home_goals}-{away_goals}",
+                    "signal_type": "Partido abierto al cierre",
+                    "reason": "El visitante va arriba solo por 1 gol; puede haber presión final.",
+                })
+
+            # Señal 3: gana local por 1 gol en 75+
+            if minute >= 75 and home_goals - away_goals == 1:
+                alerts.append({
+                    "signal_key": build_live_key(fixture_id, minute, "local_gana_por_1"),
+                    "league": league.get("name", "Liga"),
+                    "home": home,
+                    "away": away,
+                    "minute": minute,
+                    "score": f"{home_goals}-{away_goals}",
+                    "signal_type": "Partido cerrado",
+                    "reason": "El local va arriba solo por 1 gol; ojo con cierre intenso o empate.",
                 })
 
     except Exception as exc:
         logger.warning("Error en live fetch: %s", exc)
 
-    return alerts
-def format_live_alert(alert: dict) -> str:
-    return (
-        f"🔥 ALERTA EN VIVO\n\n"
-        f"{alert['home']} vs {alert['away']}\n"
-        f"Marcador: {alert['score']}\n"
-        f"Minuto: {alert['minute']}\n\n"
-        f"📊 Posible oportunidad en vivo"
-    )
+    return alerts[:MAX_LIVE_ALERTS_PER_CYCLE]
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
 
 async def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN secret not set.")
-
-    if not CHAT_ID:
-        raise RuntimeError("CHAT_ID secret not set.")
+    if not BOT_TOKEN or BOT_TOKEN == "PON_AQUI_TU_BOT_TOKEN":
+        raise RuntimeError("BOT_TOKEN no configurado.")
+    if not CHAT_ID or CHAT_ID == "PON_AQUI_TU_CHAT_ID":
+        raise RuntimeError("CHAT_ID no configurado.")
+    if not ODDS_API_KEY or ODDS_API_KEY == "PON_AQUI_TU_ODDS_API_KEY":
+        raise RuntimeError("ODDS_API_KEY no configurada.")
+    if not FOOTBALL_API_KEY or FOOTBALL_API_KEY == "PON_AQUI_TU_FOOTBALL_API_KEY":
+        raise RuntimeError("FOOTBALL_API_KEY no configurada.")
 
     bot = Bot(token=BOT_TOKEN)
     info = await bot.get_me()
     logger.info("Bot online: @%s", info.username)
 
+    last_upcoming_scan = datetime.min.replace(tzinfo=timezone.utc)
+    last_prematch_scan = datetime.min.replace(tzinfo=timezone.utc)
+    last_live_scan = datetime.min.replace(tzinfo=timezone.utc)
+
     async with httpx.AsyncClient() as client:
         while True:
             try:
-                now_local = datetime.now(ZoneInfo("America/Mexico_City"))
-                hour = now_local.hour
+                current_local = now_local()
+                current_utc = datetime.now(timezone.utc)
 
-                if hour < 7 or hour >= 22:
-                    next_start = now_local.replace(hour=7, minute=0, second=0, microsecond=0)
-                    if hour >= 22:
-                        next_start = next_start + timedelta(days=1)
+                # horario activo 7 AM a 10 PM
+                if current_local.hour < 7 or current_local.hour >= 22:
+                    next_start = current_local.replace(hour=7, minute=0, second=0, microsecond=0)
+                    if current_local.hour >= 22:
+                        next_start += timedelta(days=1)
 
-                    sleep_seconds = int((next_start - now_local).total_seconds())
-                    logger.info("Fuera de horario. Durmiendo hasta 7:00 AM (%ds).", sleep_seconds)
+                    sleep_seconds = int((next_start - current_local).total_seconds())
+                    logger.info("Fuera de horario. Durmiendo hasta las 7:00 AM (%ds).", sleep_seconds)
                     await asyncio.sleep(sleep_seconds)
                     continue
 
-                upcoming_matches = await fetch_upcoming_matches(client)
-                logger.info("Próximos partidos detectados: %s", len(upcoming_matches))
+                # próximos partidos
+                if (current_utc - last_upcoming_scan).total_seconds() >= UPCOMING_SCAN_INTERVAL:
+                    upcoming_matches = await fetch_upcoming_matches(client)
+                    logger.info("Próximos partidos detectados: %s", len(upcoming_matches))
 
-                for match in upcoming_matches:
-                    if match["match_key"] not in sent_upcoming_match_alerts:
-                        logger.info("Intentando enviar próximo partido: %s vs %s", match["home_team"], match["away_team"])
+                    for match in upcoming_matches:
+                        if match["match_key"] in sent_upcoming_match_alerts:
+                            continue
+
                         text = format_upcoming_match_alert(match)
-                        await bot.send_message(chat_id=CHAT_ID, text=text)
+                        await send_message(bot, text)
                         sent_upcoming_match_alerts.add(match["match_key"])
 
-                alerts = await fetch_pre_match_alerts(bot, client)
+                    last_upcoming_scan = current_utc
 
-                for alert in alerts:
-                    if alert["match_key"] not in sent_pre_match_signals:
-                        logger.info("Intentando enviar pre-partido: %s vs %s", alert["home_team"], alert["away_team"])
+                # pre-match
+                if (current_utc - last_prematch_scan).total_seconds() >= PREMATCH_SCAN_INTERVAL:
+                    prematch_alerts = await fetch_pre_match_alerts(bot, client)
+                    logger.info("Alertas pre-partido detectadas: %s", len(prematch_alerts))
+
+                    for alert in prematch_alerts:
+                        if alert["match_key"] in sent_pre_match_signals:
+                            continue
+
                         text = format_pre_match_alert(alert)
-                        await bot.send_message(chat_id=CHAT_ID, text=text)
+                        await send_message(bot, text)
                         sent_pre_match_signals.add(alert["match_key"])
 
-                live_alerts = await fetch_live_alerts(client)
+                    last_prematch_scan = current_utc
 
-                for alert in live_alerts:
-                    if alert["signal_key"] not in sent_live_signals:
-                        logger.info("Intentando enviar en vivo: %s vs %s", alert["home"], alert["away"])
+                # live
+                if (current_utc - last_live_scan).total_seconds() >= LIVE_SCAN_INTERVAL:
+                    live_alerts = await fetch_live_alerts(client)
+                    logger.info("Alertas live detectadas: %s", len(live_alerts))
+
+                    for alert in live_alerts:
+                        if alert["signal_key"] in sent_live_signals:
+                            continue
+
                         text = format_live_alert(alert)
-                        await bot.send_message(chat_id=CHAT_ID, text=text)
+                        await send_message(bot, text)
                         sent_live_signals.add(alert["signal_key"])
 
-                sleep_seconds = 60
-                logger.info("Sleeping %ds until next cycle...", sleep_seconds)
-                await asyncio.sleep(sleep_seconds)
+                    last_live_scan = current_utc
+
+                await asyncio.sleep(MAIN_LOOP_SLEEP)
 
             except Exception as exc:
                 logger.error("Cycle error: %s", exc)
-                sleep_seconds = CYCLE_INTERVAL
-                logger.info("Sleeping %ds until next cycle...", sleep_seconds)
-                await asyncio.sleep(sleep_seconds)
-
+                await asyncio.sleep(60)
 
 
 if __name__ == "__main__":
