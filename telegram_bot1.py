@@ -3,7 +3,7 @@ Football Betting Alerts Bot
 ----------------------------
 Data sources:
   - The Odds API  -> pre-match odds
-  - API-Football  -> live fixtures / scores
+  - API-Football  -> live fixtures / scores / statistics
 """
 
 import asyncio
@@ -49,17 +49,27 @@ PREMATCH_MAX_MINUTES = 120
 # Próximos partidos informativos
 UPCOMING_LOOKAHEAD_HOURS = 12
 
-# Filtro de valor
+# Filtro de valor pre-match
 MIN_VALUE_EDGE = 0.06  # 6%
 
 # Límites
 MAX_PREMATCH_ALERTS_PER_CYCLE = 5
-MAX_LIVE_ALERTS_PER_CYCLE = 5
+MAX_LIVE_ALERTS_PER_CYCLE = 6
 
 # Odds API
 ODDS_MARKETS = "h2h"
 ODDS_REGIONS = "uk"
 ODDS_API_REQUEST_DELAY = 1
+
+# ---------------------------------------------------------------------------
+# V3 LIVE SETTINGS
+# ---------------------------------------------------------------------------
+
+LIVE_MIN_MINUTE = 8
+LIVE_GOAL_MIN_SCORE = 7
+LIVE_CORNERS_MIN_SCORE = 6
+LIVE_CARDS_MIN_SCORE = 6
+MAX_STATS_REQUESTS_PER_CYCLE = 5
 
 # ---------------------------------------------------------------------------
 # Whitelisted leagues
@@ -161,9 +171,156 @@ def translate_pick(team_name: str, home_team: str, away_team: str) -> str:
     return team_name
 
 
-def safe_send_text(bot: Bot, text: str, parse_mode: str | None = None) -> None:
-    # helper placeholder if luego quieres centralizar más cosas
-    return
+def stat_num(value) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        value = value.strip()
+        if value.endswith("%"):
+            value = value[:-1]
+        try:
+            return int(float(value))
+        except ValueError:
+            return 0
+    return 0
+
+
+def extract_live_stat_block(stats: dict) -> dict:
+    return {
+        "shots_on_goal": stat_num(stats.get("Shots on Goal")),
+        "shots_off_goal": stat_num(stats.get("Shots off Goal")),
+        "total_shots": stat_num(stats.get("Total Shots")),
+        "blocked_shots": stat_num(stats.get("Blocked Shots")),
+        "corner_kicks": stat_num(stats.get("Corner Kicks")),
+        "dangerous_attacks": stat_num(stats.get("Dangerous Attacks")),
+        "ball_possession": stat_num(stats.get("Ball Possession")),
+        "yellow_cards": stat_num(stats.get("Yellow Cards")),
+        "red_cards": stat_num(stats.get("Red Cards")),
+        "fouls": stat_num(stats.get("Fouls")),
+    }
+
+
+def classify_live_tier(score: int) -> str:
+    if score >= 9:
+        return "VIP"
+    if score >= 7:
+        return "PRO"
+    if score >= 6:
+        return "BUENA"
+    return "NORMAL"
+
+
+def score_goal_signal(
+    minute: int,
+    team_stats: dict,
+    opp_stats: dict,
+    team_goals: int,
+    opp_goals: int,
+) -> tuple[int, list[str]]:
+    score = 0
+    reasons = []
+
+    shots_on = team_stats["shots_on_goal"]
+    dangerous = team_stats["dangerous_attacks"]
+    total_shots = team_stats["total_shots"]
+    corners = team_stats["corner_kicks"]
+
+    if minute >= 8:
+        score += 1
+        reasons.append("minuto útil")
+
+    if shots_on >= 2:
+        score += 2
+        reasons.append(f"{shots_on} tiros a puerta")
+
+    if shots_on >= 4:
+        score += 1
+
+    if dangerous >= 18:
+        score += 2
+        reasons.append(f"{dangerous} ataques peligrosos")
+
+    if dangerous >= 28:
+        score += 1
+
+    if total_shots >= 8:
+        score += 1
+        reasons.append(f"{total_shots} tiros totales")
+
+    if corners >= 4:
+        score += 1
+        reasons.append(f"{corners} corners")
+
+    if team_goals <= opp_goals:
+        score += 1
+        reasons.append("equipo presionando sin ir cómodo")
+
+    return score, reasons
+
+
+def score_corners_signal(minute: int, home_stats: dict, away_stats: dict) -> tuple[int, list[str]]:
+    score = 0
+    reasons = []
+
+    total_corners = home_stats["corner_kicks"] + away_stats["corner_kicks"]
+    total_dangerous = home_stats["dangerous_attacks"] + away_stats["dangerous_attacks"]
+    total_shots = home_stats["total_shots"] + away_stats["total_shots"]
+
+    if minute >= 15:
+        score += 1
+        reasons.append("partido avanzado")
+
+    if total_corners >= 4:
+        score += 2
+        reasons.append(f"{total_corners} corners")
+
+    if total_corners >= 6:
+        score += 1
+
+    if total_dangerous >= 24:
+        score += 2
+        reasons.append(f"{total_dangerous} ataques peligrosos")
+
+    if total_shots >= 10:
+        score += 1
+        reasons.append(f"{total_shots} tiros totales")
+
+    return score, reasons
+
+
+def score_cards_signal(minute: int, home_stats: dict, away_stats: dict) -> tuple[int, list[str]]:
+    score = 0
+    reasons = []
+
+    total_fouls = home_stats["fouls"] + away_stats["fouls"]
+    total_yellow = home_stats["yellow_cards"] + away_stats["yellow_cards"]
+    total_red = home_stats["red_cards"] + away_stats["red_cards"]
+
+    if minute >= 20:
+        score += 1
+        reasons.append("minuto suficiente")
+
+    if total_fouls >= 12:
+        score += 2
+        reasons.append(f"{total_fouls} faltas")
+
+    if total_fouls >= 18:
+        score += 1
+
+    if total_yellow >= 2:
+        score += 2
+        reasons.append(f"{total_yellow} amarillas")
+
+    if total_yellow >= 4:
+        score += 1
+
+    if total_red >= 1:
+        score += 1
+        reasons.append("partido caliente")
+
+    return score, reasons
 
 
 # ---------------------------------------------------------------------------
@@ -194,13 +351,21 @@ def format_pre_match_alert(alert: dict) -> str:
 
 
 def format_live_alert(alert: dict) -> str:
+    badge = {
+        "VIP": "💎",
+        "PRO": "🔥",
+        "BUENA": "📈",
+        "NORMAL": "📊",
+    }.get(alert["tier"], "📊")
+
     return (
-        f"🔥 ALERTA EN VIVO\n\n"
+        f"{badge} ALERTA EN VIVO {alert['tier']}\n\n"
         f"⚽ {alert['home']} vs {alert['away']}\n"
         f"🏆 Liga: {alert['league']}\n"
         f"📊 Marcador: {alert['score']}\n"
         f"⏱ Minuto: {alert['minute']}\n"
         f"🎯 Señal: {alert['signal_type']}\n"
+        f"⭐ Score: {alert['signal_score']}/10\n"
         f"📌 Motivo: {alert['reason']}"
     )
 
@@ -351,7 +516,6 @@ async def fetch_pre_match_alerts(bot: Bot, client: httpx.AsyncClient) -> list[di
 
                 commence_time = parse_iso_datetime(commence_time_raw)
 
-                # filtro PRO: solo 15 a 120 min antes
                 if not should_send_prematch(commence_time):
                     continue
 
@@ -429,6 +593,48 @@ async def fetch_pre_match_alerts(bot: Bot, client: httpx.AsyncClient) -> list[di
 
 
 # ---------------------------------------------------------------------------
+# Live statistics fetcher
+# ---------------------------------------------------------------------------
+
+async def fetch_match_stats(client: httpx.AsyncClient, fixture_id: int):
+    try:
+        r = await client.get(
+            "https://v3.football.api-sports.io/fixtures/statistics",
+            params={"fixture": fixture_id},
+            headers={"x-apisports-key": FOOTBALL_API_KEY},
+            timeout=15,
+        )
+
+        if r.status_code != 200:
+            logger.warning("Stats fixture=%s -> %s | %s", fixture_id, r.status_code, r.text)
+            return None
+
+        response = r.json().get("response", [])
+        if len(response) < 2:
+            return None
+
+        def parse_statistics(team_block: dict) -> dict:
+            parsed = {}
+            for item in team_block.get("statistics", []):
+                stat_type = item.get("type")
+                stat_value = item.get("value")
+                parsed[stat_type] = stat_value
+            return parsed
+
+        home_block = response[0]
+        away_block = response[1]
+
+        return {
+            "home": parse_statistics(home_block),
+            "away": parse_statistics(away_block),
+        }
+
+    except Exception as exc:
+        logger.warning("Error obteniendo stats fixture=%s: %s", fixture_id, exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Live alerts
 # ---------------------------------------------------------------------------
 
@@ -451,6 +657,7 @@ async def fetch_live_alerts(client: httpx.AsyncClient) -> list[dict]:
             return alerts
 
         data = r.json().get("response", [])
+        stats_requests_used = 0
 
         for match in data:
             fixture = match.get("fixture", {})
@@ -473,49 +680,115 @@ async def fetch_live_alerts(client: httpx.AsyncClient) -> list[dict]:
             if not fixture_id or not home or not away or not minute:
                 continue
 
-            # Señal 1: empate minuto 70+
-            if minute >= 70 and home_goals == away_goals:
+            if minute < LIVE_MIN_MINUTE:
+                continue
+
+            if stats_requests_used >= MAX_STATS_REQUESTS_PER_CYCLE:
+                break
+
+            stats_payload = await fetch_match_stats(client, fixture_id)
+            stats_requests_used += 1
+
+            if not stats_payload:
+                continue
+
+            home_stats = extract_live_stat_block(stats_payload["home"])
+            away_stats = extract_live_stat_block(stats_payload["away"])
+
+            # GOAL probable local
+            home_goal_score, home_goal_reasons = score_goal_signal(
+                minute=minute,
+                team_stats=home_stats,
+                opp_stats=away_stats,
+                team_goals=home_goals,
+                opp_goals=away_goals,
+            )
+
+            if home_goal_score >= LIVE_GOAL_MIN_SCORE:
                 alerts.append({
-                    "signal_key": build_live_key(fixture_id, minute, "empate_70+"),
+                    "signal_key": build_live_key(fixture_id, minute, "goal_local"),
                     "league": league.get("name", "Liga"),
                     "home": home,
                     "away": away,
                     "minute": minute,
                     "score": f"{home_goals}-{away_goals}",
-                    "signal_type": "Empate tardío",
-                    "reason": "Partido empatado en minuto avanzado, puede abrirse al final.",
+                    "signal_type": f"Gol probable - {home}",
+                    "signal_score": home_goal_score,
+                    "tier": classify_live_tier(home_goal_score),
+                    "reason": ", ".join(home_goal_reasons),
                 })
 
-            # Señal 2: gana visitante por 1 gol en 75+
-            if minute >= 75 and away_goals - home_goals == 1:
+            # GOAL probable visitante
+            away_goal_score, away_goal_reasons = score_goal_signal(
+                minute=minute,
+                team_stats=away_stats,
+                opp_stats=home_stats,
+                team_goals=away_goals,
+                opp_goals=home_goals,
+            )
+
+            if away_goal_score >= LIVE_GOAL_MIN_SCORE:
                 alerts.append({
-                    "signal_key": build_live_key(fixture_id, minute, "visitante_gana_por_1"),
+                    "signal_key": build_live_key(fixture_id, minute, "goal_visitante"),
                     "league": league.get("name", "Liga"),
                     "home": home,
                     "away": away,
                     "minute": minute,
                     "score": f"{home_goals}-{away_goals}",
-                    "signal_type": "Partido abierto al cierre",
-                    "reason": "El visitante va arriba solo por 1 gol; puede haber presión final.",
+                    "signal_type": f"Gol probable - {away}",
+                    "signal_score": away_goal_score,
+                    "tier": classify_live_tier(away_goal_score),
+                    "reason": ", ".join(away_goal_reasons),
                 })
 
-            # Señal 3: gana local por 1 gol en 75+
-            if minute >= 75 and home_goals - away_goals == 1:
+            # Corners
+            corners_score, corners_reasons = score_corners_signal(
+                minute=minute,
+                home_stats=home_stats,
+                away_stats=away_stats,
+            )
+
+            if corners_score >= LIVE_CORNERS_MIN_SCORE:
                 alerts.append({
-                    "signal_key": build_live_key(fixture_id, minute, "local_gana_por_1"),
+                    "signal_key": build_live_key(fixture_id, minute, "corners"),
                     "league": league.get("name", "Liga"),
                     "home": home,
                     "away": away,
                     "minute": minute,
                     "score": f"{home_goals}-{away_goals}",
-                    "signal_type": "Partido cerrado",
-                    "reason": "El local va arriba solo por 1 gol; ojo con cierre intenso o empate.",
+                    "signal_type": "Over corners live",
+                    "signal_score": corners_score,
+                    "tier": classify_live_tier(corners_score),
+                    "reason": ", ".join(corners_reasons),
                 })
+
+            # Cards
+            cards_score, cards_reasons = score_cards_signal(
+                minute=minute,
+                home_stats=home_stats,
+                away_stats=away_stats,
+            )
+
+            if cards_score >= LIVE_CARDS_MIN_SCORE:
+                alerts.append({
+                    "signal_key": build_live_key(fixture_id, minute, "cards"),
+                    "league": league.get("name", "Liga"),
+                    "home": home,
+                    "away": away,
+                    "minute": minute,
+                    "score": f"{home_goals}-{away_goals}",
+                    "signal_type": "Posibles más tarjetas",
+                    "signal_score": cards_score,
+                    "tier": classify_live_tier(cards_score),
+                    "reason": ", ".join(cards_reasons),
+                })
+
+        alerts.sort(key=lambda x: (-x["signal_score"], x["minute"]))
+        return alerts[:MAX_LIVE_ALERTS_PER_CYCLE]
 
     except Exception as exc:
         logger.warning("Error en live fetch: %s", exc)
-
-    return alerts[:MAX_LIVE_ALERTS_PER_CYCLE]
+        return alerts
 
 
 # ---------------------------------------------------------------------------
@@ -546,7 +819,6 @@ async def main():
                 current_local = now_local()
                 current_utc = datetime.now(timezone.utc)
 
-                # horario activo 7 AM a 10 PM
                 if current_local.hour < 7 or current_local.hour >= 22:
                     next_start = current_local.replace(hour=7, minute=0, second=0, microsecond=0)
                     if current_local.hour >= 22:
@@ -557,7 +829,7 @@ async def main():
                     await asyncio.sleep(sleep_seconds)
                     continue
 
-                # próximos partidos
+                # Próximos partidos
                 if (current_utc - last_upcoming_scan).total_seconds() >= UPCOMING_SCAN_INTERVAL:
                     upcoming_matches = await fetch_upcoming_matches(client)
                     logger.info("Próximos partidos detectados: %s", len(upcoming_matches))
@@ -572,7 +844,7 @@ async def main():
 
                     last_upcoming_scan = current_utc
 
-                # pre-match
+                # Pre-match
                 if (current_utc - last_prematch_scan).total_seconds() >= PREMATCH_SCAN_INTERVAL:
                     prematch_alerts = await fetch_pre_match_alerts(bot, client)
                     logger.info("Alertas pre-partido detectadas: %s", len(prematch_alerts))
@@ -587,7 +859,7 @@ async def main():
 
                     last_prematch_scan = current_utc
 
-                # live
+                # Live
                 if (current_utc - last_live_scan).total_seconds() >= LIVE_SCAN_INTERVAL:
                     live_alerts = await fetch_live_alerts(client)
                     logger.info("Alertas live detectadas: %s", len(live_alerts))
