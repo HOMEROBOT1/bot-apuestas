@@ -15,17 +15,18 @@ from zoneinfo import ZoneInfo
 # CONFIGURACIÓN GENERAL
 # =========================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8713741185:AAFqvoZ0Ji3xWw2FsA8BuMslfCGhQ0tMzCQ")
-CHAT_ID = str(os.getenv("CHAT_ID", "1983622390"))
-ODDS_API_KEY = os.getenv("ODDS_API_KEY", "92f3a8c48fe9834c7b1e6bbf38346064")
-API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "c455630d0023ef208f93dd0567164905")
+BOT_TOKEN = os.getenv("8713741185:AAFqvoZ0Ji3xWw2FsA8BuMslfCGhQ0tMzCQ")
+CHAT_ID = str(os.getenv("1983622390"))
+
+ODDS_API_KEY = os.getenv("92f3a8c48fe9834c7b1e6bbf38346064")
+API_FOOTBALL_KEY = os.getenv("c455630d0023ef208f93dd0567164905")
 
 TIMEZONE = "America/Mexico_City"
 ZONE = ZoneInfo(TIMEZONE)
 
-# En Railway usa mejor:
+# En Railway:
 # DB_PATH=/data/bot_state.db
-DB_PATH = os.getenv("DB_PATH", "bot_state.db")
+DB_PATH = os.getenv("DB_PATH", "/data/bot_state.db")
 
 # =========================================================
 # LIGAS
@@ -34,21 +35,21 @@ DB_PATH = os.getenv("DB_PATH", "bot_state.db")
 # 262 = Liga MX
 # 39  = Premier League
 # 135 = Serie A
-# 2   = UEFA Champions League
+# 2   = Champions League
 LEAGUES = [262, 39, 135, 2]
-
-DEFAULT_LEAGUE_SEASONS = {
-    262: 2025,
-    39: 2025,
-    135: 2025,
-    2: 2025,
-}
 
 LEAGUE_NAMES = {
     262: "Liga MX",
     39: "Premier League",
     135: "Serie A",
     2: "Champions League",
+}
+
+DEFAULT_LEAGUE_SEASONS = {
+    262: 2025,
+    39: 2025,
+    135: 2025,
+    2: 2025,
 }
 
 ODDS_SPORT_KEYS = [
@@ -210,6 +211,13 @@ def init_db():
                 updated_at TEXT NOT NULL
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS bot_stats (
+                stat_key TEXT PRIMARY KEY,
+                stat_value INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
         conn.commit()
 
 def load_league_seasons_from_db():
@@ -247,6 +255,25 @@ def save_all_default_seasons_if_missing():
                 INSERT OR IGNORE INTO league_seasons (league_id, season, updated_at)
                 VALUES (?, ?, ?)
             """, (league_id, season, now_local().isoformat()))
+        conn.commit()
+
+def bump_stat(stat_key: str, amount: int = 1):
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT stat_value FROM bot_stats WHERE stat_key = ?",
+            (stat_key,)
+        ).fetchone()
+
+        current = int(row["stat_value"]) if row else 0
+        new_value = current + amount
+
+        conn.execute("""
+            INSERT INTO bot_stats (stat_key, stat_value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(stat_key) DO UPDATE SET
+                stat_value=excluded.stat_value,
+                updated_at=excluded.updated_at
+        """, (stat_key, new_value, now_local().isoformat()))
         conn.commit()
 
 # =========================================================
@@ -318,6 +345,9 @@ def signal_key_for_match(fixture_id: int, signal_type: str, minute: int) -> str:
 
 def scoreline_text(score_home: int, score_away: int) -> str:
     return f"{score_home}-{score_away}"
+
+def pressure_score(shots_h: int, shots_a: int, corners_h: int, corners_a: int) -> int:
+    return (shots_h + shots_a) + (corners_h + corners_a)
 
 async def send_telegram_message(text: str):
     try:
@@ -417,34 +447,36 @@ def format_live_signal(
         f"{reason_map.get(signal_type, 'Revisar momentum y cuotas.')}"
     )
 
-async def send_no_matches_today_alert():
-    message = (
-        f"😴 No encontré partidos en tus ligas para el día de hoy ({today_str()}).\n\n"
-        f"🔎 Ligas revisadas: {leagues_text()}\n\n"
-        f"El bot entrará en descanso hasta mañana a las {NO_MATCHES_SLEEP_HOUR:02d}:00."
-    )
-    await send_telegram_message(message)
-
-async def send_matches_found_today_alert():
-    message = (
-        f"✅ Sí encontré partidos en tus ligas para el día de hoy ({today_str()}).\n\n"
-        f"🔎 Ligas monitoreadas: {leagues_text()}\n\n"
-        f"El bot seguirá activo buscando alertas pre-match y en vivo."
-    )
-    await send_telegram_message(message)
-
-async def send_daily_summary(total_matches: int, per_league_counts: dict):
+async def send_no_matches_today_alert_with_summary(per_league_counts: dict):
     lines = [
-        f"📋 Resumen diario de partidos ({today_str()})",
+        f"😴 No encontré partidos en tus ligas para el día de hoy ({today_str()}).",
         "",
-        f"⚽ Total de partidos detectados: {total_matches}",
-        "",
-        "📊 Por liga:",
+        "📊 Resumen por liga:",
     ]
+
     for league_name, count in per_league_counts.items():
         lines.append(f"• {league_name}: {count}")
+
+    lines.append("")
+    lines.append(f"El bot entrará en descanso hasta mañana a las {NO_MATCHES_SLEEP_HOUR:02d}:00.")
+
+    await send_telegram_message("\n".join(lines))
+
+async def send_matches_found_today_alert(total_matches: int, per_league_counts: dict):
+    lines = [
+        f"✅ Sí encontré partidos en tus ligas para el día de hoy ({today_str()}).",
+        "",
+        f"⚽ Total de partidos: {total_matches}",
+        "",
+        "📊 Resumen por liga:",
+    ]
+
+    for league_name, count in per_league_counts.items():
+        lines.append(f"• {league_name}: {count}")
+
     lines.append("")
     lines.append(f"🧠 Modo activo: {STRATEGY_MODE}")
+
     await send_telegram_message("\n".join(lines))
 
 async def send_season_change_alert(league_id: int, old_season: int | None, new_season: int, auto_applied: bool):
@@ -548,7 +580,7 @@ async def sync_league_seasons():
                     await send_season_change_alert(league_id, old_value, detected, False)
 
 # =========================================================
-# REVISIÓN DEL DÍA
+# RESUMEN DEL DÍA
 # =========================================================
 
 async def get_today_matches_summary():
@@ -629,6 +661,7 @@ async def send_upcoming_matches_alerts():
                     continue
 
                 remember_sent(sent_upcoming_match_alerts, match_key)
+                bump_stat("upcoming_alerts_sent", 1)
                 await send_telegram_message(format_upcoming_match_alert(home, away, league_name, kickoff_local))
 
             logging.info(f"Próximos partidos detectados en {league_name}: {len(fixtures)}")
@@ -685,6 +718,7 @@ async def check_prematch_odds():
 
                 if PREMATCH_MIN_AVG_ODD <= avg_price <= PREMATCH_MAX_AVG_ODD:
                     remember_sent(sent_prematch_signals, match_key)
+                    bump_stat("prematch_alerts_sent", 1)
                     await send_telegram_message(
                         format_prematch_signal(
                             home=home,
@@ -768,9 +802,6 @@ def should_signal_next_goal(minute: int, shots_total: int, corners_total: int, a
         and (shots_total >= 3 or corners_total >= 4 or attack_diff >= 2)
     )
 
-def pressure_score(shots_h: int, shots_a: int, corners_h: int, corners_a: int) -> int:
-    return (shots_h + shots_a) + (corners_h + corners_a)
-
 async def get_fixture_statistics(fixture_id: int):
     url = "https://v3.football.api-sports.io/fixtures/statistics"
     params = {"fixture": fixture_id}
@@ -816,6 +847,7 @@ async def send_live_signal_if_needed(
         return False
 
     remember_sent(sent_live_signals, key)
+    bump_stat("live_alerts_sent", 1)
 
     await send_telegram_message(
         format_live_signal(
@@ -961,13 +993,12 @@ async def main_loop():
 
                 if total_matches <= 0:
                     logging.info("No hay partidos hoy en las ligas configuradas.")
-                    await send_no_matches_today_alert()
+                    await send_no_matches_today_alert_with_summary(per_league_counts)
                     await wait_until_next_daily_check()
                     continue
 
                 logging.info("Sí hay partidos hoy. Bot activo.")
-                await send_matches_found_today_alert()
-                await send_daily_summary(total_matches, per_league_counts)
+                await send_matches_found_today_alert(total_matches, per_league_counts)
                 await send_upcoming_matches_alerts()
 
             await check_prematch_odds()
@@ -985,7 +1016,7 @@ async def main_loop():
 
 async def startup_message():
     msg = (
-        f"🤖 Bot de apuestas V8 limpia + Champions iniciado\n\n"
+        f"🤖 Bot de apuestas V9 iniciado\n\n"
         f"Funciones activas:\n"
         f"• Revisión diaria a las 7:00 am\n"
         f"• Sincronización automática de temporadas\n"
@@ -994,10 +1025,11 @@ async def startup_message():
         f"• Sin getUpdates para evitar conflicto 409\n"
         f"• Incluye: Liga MX, Premier League, Serie A y Champions League\n"
         f"• Si cambia la temporada, el bot la actualiza en DB y te avisa\n"
-        f"• Si no hay partidos hoy, avisa por Telegram y duerme hasta mañana\n"
-        f"• Resumen diario de partidos por liga\n"
+        f"• Si no hay partidos hoy, manda resumen por liga y duerme hasta mañana\n"
+        f"• Alertas de próximos partidos\n"
         f"• Señales pre-match\n"
-        f"• Señales live por tipo de oportunidad\n"
+        f"• Señales live: presión, over 1.5, over 2.5, under 3.5 y siguiente gol\n"
+        f"• Anti duplicados\n"
         f"• Modo activo: {STRATEGY_MODE}\n"
         f"• DB_PATH: {DB_PATH}"
     )
