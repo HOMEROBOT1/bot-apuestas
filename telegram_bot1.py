@@ -34,24 +34,28 @@ DB_PATH = os.getenv("DB_PATH", "bot_state.db")
 # 262 = Liga MX
 # 39  = Premier League
 # 135 = Serie A
-LEAGUES = [262, 39, 135]
+# 2   = UEFA Champions League
+LEAGUES = [262, 39, 135, 2]
 
 DEFAULT_LEAGUE_SEASONS = {
     262: 2025,
     39: 2025,
     135: 2025,
+    2: 2025,
 }
 
 LEAGUE_NAMES = {
     262: "Liga MX",
     39: "Premier League",
     135: "Serie A",
+    2: "Champions League",
 }
 
 ODDS_SPORT_KEYS = [
     "soccer_mexico_ligamx",
     "soccer_epl",
     "soccer_italy_serie_a",
+    "soccer_uefa_champs_league",
 ]
 
 # =========================================================
@@ -981,13 +985,14 @@ async def main_loop():
 
 async def startup_message():
     msg = (
-        f"🤖 Bot de apuestas V8 limpia iniciado\n\n"
+        f"🤖 Bot de apuestas V8 limpia + Champions iniciado\n\n"
         f"Funciones activas:\n"
         f"• Revisión diaria a las 7:00 am\n"
         f"• Sincronización automática de temporadas\n"
         f"• Persistencia en SQLite\n"
         f"• Sin comandos de Telegram\n"
         f"• Sin getUpdates para evitar conflicto 409\n"
+        f"• Incluye: Liga MX, Premier League, Serie A y Champions League\n"
         f"• Si cambia la temporada, el bot la actualiza en DB y te avisa\n"
         f"• Si no hay partidos hoy, avisa por Telegram y duerme hasta mañana\n"
         f"• Resumen diario de partidos por liga\n"
