@@ -1,6 +1,6 @@
 """
-Football Betting Alerts Bot - V5
---------------------------------
+Football Betting Alerts Bot - V5 Completo
+-----------------------------------------
 Incluye:
 - Pre-match con edge (The Odds API)
 - Live stats y scoring (API-Football)
@@ -17,10 +17,10 @@ Incluye:
 import asyncio
 import json
 import logging
-from datetime import datetime, timezone, timedelta
-from statistics import mean
-from pathlib import Path
 import re
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from statistics import mean
 
 import httpx
 from telegram import Bot
@@ -926,7 +926,7 @@ async def fetch_live_alerts(client: httpx.AsyncClient, bankroll_actual: float) -
             home_stats = extract_live_stat_block(stats_payload["home"])
             away_stats = extract_live_stat_block(stats_payload["away"])
 
-            # GOAL probable local -> prefer Over goals market for settlement
+            # GOALS OVER LIVE
             home_goal_score, home_goal_reasons = score_goal_signal(
                 minute=minute,
                 team_stats=home_stats,
@@ -975,7 +975,7 @@ async def fetch_live_alerts(client: httpx.AsyncClient, bankroll_actual: float) -
                         "fixture_id": fixture_id,
                     })
 
-            # Corners
+            # CORNERS
             corners_score, corners_reasons = score_corners_signal(
                 minute=minute,
                 home_stats=home_stats,
@@ -1022,7 +1022,7 @@ async def fetch_live_alerts(client: httpx.AsyncClient, bankroll_actual: float) -
                         "fixture_id": fixture_id,
                     })
 
-            # Cards
+            # CARDS
             cards_score, cards_reasons = score_cards_signal(
                 minute=minute,
                 home_stats=home_stats,
@@ -1261,6 +1261,7 @@ async def settle_live_bets(client: httpx.AsyncClient, history: list[dict]) -> bo
 
             match = response[0]
             status = match.get("fixture", {}).get("status", {}).get("short")
+
             if status not in {"FT", "AET", "PEN"}:
                 continue
 
