@@ -17,15 +17,23 @@ from zoneinfo import ZoneInfo
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8713741185:AAFqvoZ0Ji3xWw2FsA8BuMslfCGhQ0tMzCQ")
 CHAT_ID = str(os.getenv("CHAT_ID", "1983622390"))
-
 ODDS_API_KEY = os.getenv("ODDS_API_KEY", "92f3a8c48fe9834c7b1e6bbf38346064")
 API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "c455630d0023ef208f93dd0567164905")
 
 TIMEZONE = "America/Mexico_City"
 ZONE = ZoneInfo(TIMEZONE)
 
+# En Railway usa mejor:
+# DB_PATH=/data/bot_state.db
 DB_PATH = os.getenv("DB_PATH", "bot_state.db")
 
+# =========================================================
+# LIGAS
+# =========================================================
+
+# 262 = Liga MX
+# 39  = Premier League
+# 135 = Serie A
 LEAGUES = [262, 39, 135]
 
 DEFAULT_LEAGUE_SEASONS = {
@@ -47,8 +55,11 @@ ODDS_SPORT_KEYS = [
 ]
 
 # =========================================================
-# MODOS
+# MODO FIJO
+# Opciones: conservador | balanceado | agresivo
 # =========================================================
+
+STRATEGY_MODE = os.getenv("STRATEGY_MODE", "balanceado").strip().lower()
 
 STRATEGY_PROFILES = {
     "conservador": {
@@ -92,19 +103,22 @@ STRATEGY_PROFILES = {
     },
 }
 
-STRATEGY_MODE = "balanceado"
+if STRATEGY_MODE not in STRATEGY_PROFILES:
+    STRATEGY_MODE = "balanceado"
 
-MAIN_LOOP_SECONDS = 180
-PREMATCH_MIN_AVG_ODD = 1.70
-PREMATCH_MAX_AVG_ODD = 2.40
-LIVE_MIN_MINUTE = 20
-LIVE_MAX_MINUTE = 75
-LIVE_GOALS_MAX = 3
-MIN_TOTAL_SHOTS_ON_TARGET = 2
-MIN_TOTAL_CORNERS = 3
-MIN_ATTACK_DIFF = 2
-SIGNAL_WINDOW_MINUTES = 10
-LIVE_TTL_MINUTES = 45
+PROFILE = STRATEGY_PROFILES[STRATEGY_MODE]
+
+MAIN_LOOP_SECONDS = PROFILE["main_loop_seconds"]
+PREMATCH_MIN_AVG_ODD = PROFILE["prematch_min_avg_odd"]
+PREMATCH_MAX_AVG_ODD = PROFILE["prematch_max_avg_odd"]
+LIVE_MIN_MINUTE = PROFILE["live_min_minute"]
+LIVE_MAX_MINUTE = PROFILE["live_max_minute"]
+LIVE_GOALS_MAX = PROFILE["live_goals_max"]
+MIN_TOTAL_SHOTS_ON_TARGET = PROFILE["min_total_shots_on_target"]
+MIN_TOTAL_CORNERS = PROFILE["min_total_corners"]
+MIN_ATTACK_DIFF = PROFILE["min_attack_diff"]
+SIGNAL_WINDOW_MINUTES = PROFILE["signal_window_minutes"]
+LIVE_TTL_MINUTES = PROFILE["live_ttl_minutes"]
 
 # =========================================================
 # REGLAS
@@ -152,8 +166,6 @@ sent_upcoming_match_alerts = {}
 last_daily_check_date = None
 last_season_sync_date = None
 
-BOT_PAUSED = False
-
 # =========================================================
 # LOGGING
 # =========================================================
@@ -194,35 +206,13 @@ def init_db():
                 updated_at TEXT NOT NULL
             )
         """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS bot_meta (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-        """)
         conn.commit()
-
-def db_set_meta(key: str, value: str):
-    with get_db_connection() as conn:
-        conn.execute("""
-            INSERT INTO bot_meta (key, value, updated_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(key) DO UPDATE SET
-                value=excluded.value,
-                updated_at=excluded.updated_at
-        """, (key, value, now_local().isoformat()))
-        conn.commit()
-
-def db_get_meta(key: str, default: str | None = None) -> str | None:
-    with get_db_connection() as conn:
-        row = conn.execute("SELECT value FROM bot_meta WHERE key = ?", (key,)).fetchone()
-    return row["value"] if row else default
 
 def load_league_seasons_from_db():
     global LEAGUE_SEASONS
 
     merged = DEFAULT_LEAGUE_SEASONS.copy()
+
     with get_db_connection() as conn:
         rows = conn.execute("SELECT league_id, season FROM league_seasons").fetchall()
 
@@ -254,18 +244,6 @@ def save_all_default_seasons_if_missing():
                 VALUES (?, ?, ?)
             """, (league_id, season, now_local().isoformat()))
         conn.commit()
-
-def load_runtime_settings():
-    global BOT_PAUSED
-
-    saved_mode = db_get_meta("strategy_mode", "balanceado")
-    apply_strategy_mode(saved_mode)
-
-    BOT_PAUSED = (db_get_meta("bot_paused", "0") == "1")
-
-def persist_runtime_settings():
-    db_set_meta("strategy_mode", STRATEGY_MODE)
-    db_set_meta("bot_paused", "1" if BOT_PAUSED else "0")
 
 # =========================================================
 # HELPERS
@@ -337,45 +315,14 @@ def signal_key_for_match(fixture_id: int, signal_type: str, minute: int) -> str:
 def scoreline_text(score_home: int, score_away: int) -> str:
     return f"{score_home}-{score_away}"
 
-def apply_strategy_mode(mode: str):
-    global STRATEGY_MODE
-    global MAIN_LOOP_SECONDS
-    global PREMATCH_MIN_AVG_ODD
-    global PREMATCH_MAX_AVG_ODD
-    global LIVE_MIN_MINUTE
-    global LIVE_MAX_MINUTE
-    global LIVE_GOALS_MAX
-    global MIN_TOTAL_SHOTS_ON_TARGET
-    global MIN_TOTAL_CORNERS
-    global MIN_ATTACK_DIFF
-    global SIGNAL_WINDOW_MINUTES
-    global LIVE_TTL_MINUTES
-
-    mode = (mode or "").strip().lower()
-    if mode not in STRATEGY_PROFILES:
-        mode = "balanceado"
-
-    profile = STRATEGY_PROFILES[mode]
-
-    STRATEGY_MODE = mode
-    MAIN_LOOP_SECONDS = profile["main_loop_seconds"]
-    PREMATCH_MIN_AVG_ODD = profile["prematch_min_avg_odd"]
-    PREMATCH_MAX_AVG_ODD = profile["prematch_max_avg_odd"]
-    LIVE_MIN_MINUTE = profile["live_min_minute"]
-    LIVE_MAX_MINUTE = profile["live_max_minute"]
-    LIVE_GOALS_MAX = profile["live_goals_max"]
-    MIN_TOTAL_SHOTS_ON_TARGET = profile["min_total_shots_on_target"]
-    MIN_TOTAL_CORNERS = profile["min_total_corners"]
-    MIN_ATTACK_DIFF = profile["min_attack_diff"]
-    SIGNAL_WINDOW_MINUTES = profile["signal_window_minutes"]
-    LIVE_TTL_MINUTES = profile["live_ttl_minutes"]
-
 async def send_telegram_message(text: str):
     try:
         await bot.send_message(chat_id=CHAT_ID, text=text)
         logging.info("Mensaje enviado a Telegram.")
     except TelegramError as e:
         logging.exception(f"Error enviando mensaje a Telegram: {e}")
+    except Exception as e:
+        logging.exception(f"Error general enviando mensaje a Telegram: {e}")
 
 # =========================================================
 # REQUESTS
@@ -526,41 +473,6 @@ async def send_db_loaded_alert():
         lines.append(f"• {LEAGUE_NAMES.get(league_id, league_id)}: {LEAGUE_SEASONS.get(league_id)}")
     lines.append("")
     lines.append(f"📁 DB_PATH: {DB_PATH}")
-    await send_telegram_message("\n".join(lines))
-
-async def send_status_message():
-    lines = [
-        "📊 Estado del bot",
-        "",
-        f"⏯ Estado: {'Pausado' if BOT_PAUSED else 'Activo'}",
-        f"🧠 Modo: {STRATEGY_MODE}",
-        f"⏱ Ciclo principal: {MAIN_LOOP_SECONDS}s",
-        f"🏆 Ligas: {leagues_text()}",
-        "",
-        "📆 Temporadas activas:",
-    ]
-    for league_id in LEAGUES:
-        lines.append(f"• {LEAGUE_NAMES.get(league_id, league_id)}: {LEAGUE_SEASONS.get(league_id)}")
-    await send_telegram_message("\n".join(lines))
-
-async def send_help_message():
-    msg = (
-        "🤖 Comandos disponibles\n\n"
-        "/status - Ver estado del bot\n"
-        "/pause - Pausar el bot\n"
-        "/resume - Reactivar el bot\n"
-        "/mode conservador - Cambiar modo\n"
-        "/mode balanceado - Cambiar modo\n"
-        "/mode agresivo - Cambiar modo\n"
-        "/seasons - Ver temporadas activas\n"
-        "/help - Ver ayuda"
-    )
-    await send_telegram_message(msg)
-
-async def send_seasons_message():
-    lines = ["📆 Temporadas activas", ""]
-    for league_id in LEAGUES:
-        lines.append(f"• {LEAGUE_NAMES.get(league_id, league_id)}: {LEAGUE_SEASONS.get(league_id)}")
     await send_telegram_message("\n".join(lines))
 
 # =========================================================
@@ -1019,88 +931,6 @@ async def check_live_matches():
         logging.exception(f"Error revisando partidos live: {e}")
 
 # =========================================================
-# COMANDOS TELEGRAM
-# =========================================================
-
-async def handle_command(text: str):
-    global BOT_PAUSED
-
-    text = (text or "").strip()
-    lower = text.lower()
-
-    if lower == "/status":
-        await send_status_message()
-        return
-
-    if lower == "/pause":
-        BOT_PAUSED = True
-        persist_runtime_settings()
-        await send_telegram_message("⏸ Bot pausado. No enviará señales hasta que uses /resume.")
-        return
-
-    if lower == "/resume":
-        BOT_PAUSED = False
-        persist_runtime_settings()
-        await send_telegram_message("▶️ Bot reactivado. Volverá a operar normal.")
-        return
-
-    if lower.startswith("/mode"):
-        parts = lower.split()
-        if len(parts) != 2 or parts[1] not in STRATEGY_PROFILES:
-            await send_telegram_message("⚠️ Usa /mode conservador o /mode balanceado o /mode agresivo")
-            return
-
-        apply_strategy_mode(parts[1])
-        persist_runtime_settings()
-        await send_telegram_message(
-            f"🧠 Modo cambiado a: {STRATEGY_MODE}\n\n"
-            f"⏱ Nuevo ciclo principal: {MAIN_LOOP_SECONDS}s"
-        )
-        return
-
-    if lower == "/seasons":
-        await send_seasons_message()
-        return
-
-    if lower == "/help":
-        await send_help_message()
-        return
-
-async def poll_telegram_commands():
-    offset = int(db_get_meta("telegram_update_offset", "0") or "0")
-
-    while True:
-        try:
-            updates = await bot.get_updates(
-                offset=offset,
-                timeout=30,
-                allowed_updates=["message"],
-            )
-
-            for update in updates:
-                offset = update.update_id + 1
-                db_set_meta("telegram_update_offset", str(offset))
-
-                message = getattr(update, "message", None)
-                if not message:
-                    continue
-
-                chat = getattr(message, "chat", None)
-                if not chat or str(chat.id) != CHAT_ID:
-                    continue
-
-                text = getattr(message, "text", None)
-                if not text or not text.startswith("/"):
-                    continue
-
-                logging.info(f"Comando recibido: {text}")
-                await handle_command(text)
-
-        except Exception as e:
-            logging.exception(f"Error en poll_telegram_commands: {e}")
-            await asyncio.sleep(5)
-
-# =========================================================
 # LOOP PRINCIPAL
 # =========================================================
 
@@ -1113,10 +943,6 @@ async def main_loop():
             today = now.strftime("%Y-%m-%d")
 
             cleanup_all_caches()
-
-            if BOT_PAUSED:
-                await asyncio.sleep(10)
-                continue
 
             if last_season_sync_date != today and now.hour >= SEASON_RECHECK_HOUR:
                 last_season_sync_date = today
@@ -1155,20 +981,19 @@ async def main_loop():
 
 async def startup_message():
     msg = (
-        f"🤖 Bot de apuestas V8 iniciado\n\n"
+        f"🤖 Bot de apuestas V8 limpia iniciado\n\n"
         f"Funciones activas:\n"
         f"• Revisión diaria a las 7:00 am\n"
         f"• Sincronización automática de temporadas\n"
         f"• Persistencia en SQLite\n"
-        f"• Control por comandos de Telegram\n"
-        f"• /pause /resume /status /mode /seasons /help\n"
+        f"• Sin comandos de Telegram\n"
+        f"• Sin getUpdates para evitar conflicto 409\n"
         f"• Si cambia la temporada, el bot la actualiza en DB y te avisa\n"
         f"• Si no hay partidos hoy, avisa por Telegram y duerme hasta mañana\n"
         f"• Resumen diario de partidos por liga\n"
         f"• Señales pre-match\n"
         f"• Señales live por tipo de oportunidad\n"
         f"• Modo activo: {STRATEGY_MODE}\n"
-        f"• Estado: {'Pausado' if BOT_PAUSED else 'Activo'}\n"
         f"• DB_PATH: {DB_PATH}"
     )
     await send_telegram_message(msg)
@@ -1177,15 +1002,10 @@ async def main():
     init_db()
     save_all_default_seasons_if_missing()
     load_league_seasons_from_db()
-    load_runtime_settings()
     await send_db_loaded_alert()
     await sync_league_seasons()
     await startup_message()
-
-    await asyncio.gather(
-        main_loop(),
-        poll_telegram_commands(),
-    )
+    await main_loop()
 
 if __name__ == "__main__":
     asyncio.run(main())
