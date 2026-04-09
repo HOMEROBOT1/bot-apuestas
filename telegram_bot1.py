@@ -1,16 +1,17 @@
 """
-Football Betting Alerts Bot - Modo Dinero
------------------------------------------
-Data sources:
-  - The Odds API  -> pre-match odds
-  - API-Football  -> live fixtures / scores / statistics / live odds
-
+Football Betting Alerts Bot - V5
+--------------------------------
 Incluye:
-- Pre-match con edge
-- Live stats (V2)
-- Scoring inteligente (V3)
-- Live odds + edge estimado (V4)
-- Bankroll / stake / historial / resumen diario
+- Pre-match con edge (The Odds API)
+- Live stats y scoring (API-Football)
+- Live odds + edge estimado
+- Modo dinero
+- Historial JSON
+- Liquidación automática:
+    * Pre-match 1X2
+    * Live over goals
+    * Live over corners
+    * Live over tarjetas
 """
 
 import asyncio
@@ -19,6 +20,7 @@ import logging
 from datetime import datetime, timezone, timedelta
 from statistics import mean
 from pathlib import Path
+import re
 
 import httpx
 from telegram import Bot
@@ -45,45 +47,29 @@ CHAT_ID = "1983622390"
 
 LOCAL_TZ = ZoneInfo("America/Mexico_City")
 
-# Ciclos
 PREMATCH_SCAN_INTERVAL = 180
 LIVE_SCAN_INTERVAL = 60
 UPCOMING_SCAN_INTERVAL = 300
 SETTLEMENT_SCAN_INTERVAL = 300
 MAIN_LOOP_SLEEP = 60
 
-# Ventana pre-match
 PREMATCH_MIN_MINUTES = 15
 PREMATCH_MAX_MINUTES = 120
-
-# Próximos partidos informativos
 UPCOMING_LOOKAHEAD_HOURS = 12
+MIN_VALUE_EDGE = 0.06
 
-# Filtro de valor pre-match
-MIN_VALUE_EDGE = 0.06  # 6%
-
-# Límites
 MAX_PREMATCH_ALERTS_PER_CYCLE = 5
 MAX_LIVE_ALERTS_PER_CYCLE = 6
 
-# Odds API
 ODDS_MARKETS = "h2h"
 ODDS_REGIONS = "uk"
 ODDS_API_REQUEST_DELAY = 1
-
-# ---------------------------------------------------------------------------
-# V3 LIVE SETTINGS
-# ---------------------------------------------------------------------------
 
 LIVE_MIN_MINUTE = 8
 LIVE_GOAL_MIN_SCORE = 7
 LIVE_CORNERS_MIN_SCORE = 6
 LIVE_CARDS_MIN_SCORE = 6
 MAX_STATS_REQUESTS_PER_CYCLE = 5
-
-# ---------------------------------------------------------------------------
-# V4 LIVE ODDS SETTINGS
-# ---------------------------------------------------------------------------
 
 ENABLE_V4_LIVE_ODDS = True
 LIVE_ODDS_MIN_EDGE = 0.08
@@ -97,20 +83,12 @@ LIVE_CORNERS_MAX_ODDS = 2.80
 LIVE_CARDS_MIN_ODDS = 1.60
 LIVE_CARDS_MAX_ODDS = 2.80
 
-# ---------------------------------------------------------------------------
-# Modo dinero
-# ---------------------------------------------------------------------------
-
 BANKROLL_INICIAL = 1000.00
 BANKROLL_STATE_FILE = Path("bankroll_state.json")
 BET_HISTORY_FILE = Path("bet_history.json")
 
 DAILY_SUMMARY_HOUR = 21
 DAILY_SUMMARY_MINUTE = 55
-
-# ---------------------------------------------------------------------------
-# Whitelisted leagues
-# ---------------------------------------------------------------------------
 
 WHITELISTED_SPORTS = {
     "soccer_epl": "🇬🇧 Premier League",
@@ -131,7 +109,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# State
+# JSON state helpers
 # ---------------------------------------------------------------------------
 
 def ensure_json_file(path: Path, default_data):
@@ -177,9 +155,8 @@ def load_bet_history():
 def save_bet_history(history: list[dict]):
     save_json(BET_HISTORY_FILE, history)
 
-
 # ---------------------------------------------------------------------------
-# Helpers
+# General helpers
 # ---------------------------------------------------------------------------
 
 def now_local() -> datetime:
@@ -215,7 +192,6 @@ def normalize_text(value: str) -> str:
 def get_match_teams_from_odds_event(game: dict) -> tuple[str, str]:
     home_team = game.get("home_team") or "Local"
     away_team = game.get("away_team")
-
     if away_team:
         return home_team, away_team
 
@@ -303,6 +279,91 @@ def classify_live_tier(score: int) -> str:
         return "BUENA"
     return "NORMAL"
 
+
+def extract_line_from_label(label: str) -> float | None:
+    if not label:
+        return None
+
+    match = re.search(r"(\d+(?:\.\d+)?)", label)
+    if not match:
+        return None
+
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
+
+
+def get_stake_by_score(score: int, bankroll_actual: float) -> float:
+    if score >= 9:
+        return round(bankroll_actual * 0.03, 2)
+    if score >= 7:
+        return round(bankroll_actual * 0.02, 2)
+    if score >= 6:
+        return round(bankroll_actual * 0.01, 2)
+    return 0.0
+
+
+def bankroll_summary(history: list[dict], bankroll_inicial: float) -> dict:
+    settled = [b for b in history if b.get("resultado") in {"ganada", "perdida"}]
+
+    total_bets = len(settled)
+    wins = len([b for b in settled if b["resultado"] == "ganada"])
+    losses = len([b for b in settled if b["resultado"] == "perdida"])
+    pending = len([b for b in history if b.get("resultado") == "pendiente"])
+
+    total_staked = sum(float(b.get("stake", 0.0)) for b in settled)
+    total_profit = sum(float(b.get("profit", 0.0)) for b in settled)
+
+    roi = (total_profit / total_staked * 100) if total_staked > 0 else 0.0
+    bankroll_actual = bankroll_inicial + total_profit
+
+    return {
+        "total_bets": total_bets,
+        "wins": wins,
+        "losses": losses,
+        "pending": pending,
+        "total_staked": round(total_staked, 2),
+        "profit": round(total_profit, 2),
+        "roi": round(roi, 2),
+        "bankroll_actual": round(bankroll_actual, 2),
+    }
+
+
+def current_bankroll(history: list[dict], bankroll_inicial: float) -> float:
+    return bankroll_summary(history, bankroll_inicial)["bankroll_actual"]
+
+
+def format_money(x: float) -> str:
+    sign = "+" if x > 0 else ""
+    return f"{sign}{x:.2f}"
+
+
+def format_daily_summary_text(summary: dict) -> str:
+    return (
+        "💰 REPORTE DEL BOT\n\n"
+        f"✅ Apuestas cerradas: {summary['total_bets']}\n"
+        f"🟢 Ganadas: {summary['wins']}\n"
+        f"🔴 Perdidas: {summary['losses']}\n"
+        f"⏳ Pendientes: {summary['pending']}\n"
+        f"💸 Total apostado: {summary['total_staked']:.2f}\n"
+        f"📈 Profit neto: {format_money(summary['profit'])}\n"
+        f"📊 ROI: {summary['roi']:.2f}%\n"
+        f"🏦 Bank actual: {summary['bankroll_actual']:.2f}"
+    )
+
+
+def register_bet(history: list[dict], bet: dict) -> bool:
+    bet_id = bet["bet_id"]
+    if any(item.get("bet_id") == bet_id for item in history):
+        return False
+    history.append(bet)
+    save_bet_history(history)
+    return True
+
+# ---------------------------------------------------------------------------
+# Signal scoring
+# ---------------------------------------------------------------------------
 
 def score_goal_signal(
     minute: int,
@@ -414,6 +475,9 @@ def score_cards_signal(minute: int, home_stats: dict, away_stats: dict) -> tuple
 
     return score, reasons
 
+# ---------------------------------------------------------------------------
+# Live odds helpers
+# ---------------------------------------------------------------------------
 
 def find_best_live_odd(live_odds: dict, bet_names: list[str], labels: list[str]) -> dict | None:
     if not live_odds:
@@ -448,29 +512,11 @@ def estimate_fair_odds_from_score(score: int, signal_type: str) -> float:
     score = max(1, min(10, score))
 
     if signal_type == "goal":
-        mapping = {
-            6: 2.30,
-            7: 2.05,
-            8: 1.85,
-            9: 1.70,
-            10: 1.60,
-        }
+        mapping = {6: 2.30, 7: 2.05, 8: 1.85, 9: 1.70, 10: 1.60}
     elif signal_type == "corners":
-        mapping = {
-            6: 2.10,
-            7: 1.95,
-            8: 1.80,
-            9: 1.70,
-            10: 1.60,
-        }
+        mapping = {6: 2.10, 7: 1.95, 8: 1.80, 9: 1.70, 10: 1.60}
     else:
-        mapping = {
-            6: 2.15,
-            7: 2.00,
-            8: 1.85,
-            9: 1.75,
-            10: 1.65,
-        }
+        mapping = {6: 2.15, 7: 2.00, 8: 1.85, 9: 1.75, 10: 1.65}
 
     if score <= 5:
         return 2.50
@@ -482,77 +528,6 @@ def compute_live_edge(live_odd: float, fair_odd: float) -> float:
     if not live_odd or not fair_odd or fair_odd <= 0:
         return 0.0
     return (live_odd / fair_odd) - 1.0
-
-
-def get_stake_by_score(score: int, bankroll_actual: float) -> float:
-    if score >= 9:
-        return round(bankroll_actual * 0.03, 2)
-    if score >= 7:
-        return round(bankroll_actual * 0.02, 2)
-    if score >= 6:
-        return round(bankroll_actual * 0.01, 2)
-    return 0.0
-
-
-def bankroll_summary(history: list[dict], bankroll_inicial: float) -> dict:
-    settled = [b for b in history if b.get("resultado") in {"ganada", "perdida"}]
-
-    total_bets = len(settled)
-    wins = len([b for b in settled if b["resultado"] == "ganada"])
-    losses = len([b for b in settled if b["resultado"] == "perdida"])
-
-    total_staked = sum(float(b.get("stake", 0.0)) for b in settled)
-    total_profit = sum(float(b.get("profit", 0.0)) for b in settled)
-
-    roi = (total_profit / total_staked * 100) if total_staked > 0 else 0.0
-    bankroll_actual = bankroll_inicial + total_profit
-
-    pending = len([b for b in history if b.get("resultado") == "pendiente"])
-
-    return {
-        "total_bets": total_bets,
-        "wins": wins,
-        "losses": losses,
-        "pending": pending,
-        "total_staked": round(total_staked, 2),
-        "profit": round(total_profit, 2),
-        "roi": round(roi, 2),
-        "bankroll_actual": round(bankroll_actual, 2),
-    }
-
-
-def current_bankroll(history: list[dict], bankroll_inicial: float) -> float:
-    summary = bankroll_summary(history, bankroll_inicial)
-    return summary["bankroll_actual"]
-
-
-def format_money(x: float) -> str:
-    sign = "+" if x > 0 else ""
-    return f"{sign}{x:.2f}"
-
-
-def format_daily_summary_text(summary: dict) -> str:
-    return (
-        "💰 REPORTE DEL BOT\n\n"
-        f"✅ Apuestas cerradas: {summary['total_bets']}\n"
-        f"🟢 Ganadas: {summary['wins']}\n"
-        f"🔴 Perdidas: {summary['losses']}\n"
-        f"⏳ Pendientes: {summary['pending']}\n"
-        f"💸 Total apostado: {summary['total_staked']:.2f}\n"
-        f"📈 Profit neto: {format_money(summary['profit'])}\n"
-        f"📊 ROI: {summary['roi']:.2f}%\n"
-        f"🏦 Bank actual: {summary['bankroll_actual']:.2f}"
-    )
-
-
-def register_bet(history: list[dict], bet: dict) -> bool:
-    bet_id = bet["bet_id"]
-    if any(item.get("bet_id") == bet_id for item in history):
-        return False
-    history.append(bet)
-    save_bet_history(history)
-    return True
-
 
 # ---------------------------------------------------------------------------
 # Formatting
@@ -568,7 +543,6 @@ def format_upcoming_match_alert(match: dict) -> str:
 
 
 def format_pre_match_alert(alert: dict) -> str:
-    stake_line = f"\n💵 Stake sugerido: {alert['stake']:.2f}"
     return (
         f"📊 ALERTA PRE-PARTIDO\n\n"
         f"⚽ {alert['home_team']} vs {alert['away_team']}\n"
@@ -578,8 +552,8 @@ def format_pre_match_alert(alert: dict) -> str:
         f"📉 Cuota promedio: {alert['avg_odds']:.2f}\n"
         f"🔥 Edge: {alert['edge_pct']:.2f}%\n"
         f"⏳ Faltan: {alert['minutes_to_start']} min\n"
-        f"🕒 Hora: {format_local_hour(alert['commence_time'])}"
-        f"{stake_line}"
+        f"🕒 Hora: {format_local_hour(alert['commence_time'])}\n"
+        f"💵 Stake sugerido: {alert['stake']:.2f}"
     )
 
 
@@ -591,6 +565,9 @@ def format_live_alert(alert: dict) -> str:
         "NORMAL": "📊",
     }.get(alert["tier"], "📊")
 
+    market_line = f"\n📍 Mercado: {alert['market_name']}" if alert.get("market_name") else ""
+    label_line = f"\n🏷 Línea: {alert['market_label']}" if alert.get("market_label") else ""
+
     odds_line = ""
     if alert.get("live_odd") is not None:
         odds_line = (
@@ -599,13 +576,7 @@ def format_live_alert(alert: dict) -> str:
             f"\n🔥 Edge live: {alert['live_edge_pct']:.2f}%"
         )
 
-    market_line = ""
-    if alert.get("market_name"):
-        market_line = f"\n📍 Mercado: {alert['market_name']}"
-
-    stake_line = ""
-    if alert.get("stake") is not None:
-        stake_line = f"\n💵 Stake sugerido: {alert['stake']:.2f}"
+    stake_line = f"\n💵 Stake sugerido: {alert['stake']:.2f}" if alert.get("stake") is not None else ""
 
     return (
         f"{badge} ALERTA EN VIVO {alert['tier']}\n\n"
@@ -616,11 +587,11 @@ def format_live_alert(alert: dict) -> str:
         f"🎯 Señal: {alert['signal_type']}\n"
         f"⭐ Score: {alert['signal_score']}/10"
         f"{market_line}"
+        f"{label_line}"
         f"{odds_line}"
         f"{stake_line}\n"
         f"📌 Motivo: {alert['reason']}"
     )
-
 
 # ---------------------------------------------------------------------------
 # Telegram
@@ -628,17 +599,13 @@ def format_live_alert(alert: dict) -> str:
 
 async def send_message(bot: Bot, text: str) -> None:
     try:
-        await bot.send_message(
-            chat_id=CHAT_ID,
-            text=text,
-        )
+        await bot.send_message(chat_id=CHAT_ID, text=text)
         logger.info("Mensaje enviado (%d chars)", len(text))
     except TelegramError as exc:
         logger.error("Telegram error: %s", exc)
 
-
 # ---------------------------------------------------------------------------
-# Upcoming matches
+# API fetchers
 # ---------------------------------------------------------------------------
 
 async def fetch_upcoming_matches(client: httpx.AsyncClient) -> list[dict]:
@@ -669,10 +636,6 @@ async def fetch_upcoming_matches(client: httpx.AsyncClient) -> list[dict]:
                 )
 
                 if r.status_code != 200:
-                    logger.warning(
-                        "API-Football fixtures league=%s date=%s -> %s | %s",
-                        league_id, date_str, r.status_code, r.text
-                    )
                     continue
 
                 response_data = r.json().get("response", [])
@@ -697,7 +660,6 @@ async def fetch_upcoming_matches(client: httpx.AsyncClient) -> list[dict]:
 
                     kickoff = parse_iso_datetime(kickoff_str)
                     kickoff_local = utc_to_local(kickoff)
-
                     if not (now_mx <= kickoff_local <= end_time):
                         continue
 
@@ -719,10 +681,6 @@ async def fetch_upcoming_matches(client: httpx.AsyncClient) -> list[dict]:
 
     return matches
 
-
-# ---------------------------------------------------------------------------
-# Pre-match alerts
-# ---------------------------------------------------------------------------
 
 async def fetch_pre_match_alerts(bot: Bot, client: httpx.AsyncClient, bankroll_actual: float) -> list[dict]:
     alerts: list[dict] = []
@@ -746,14 +704,8 @@ async def fetch_pre_match_alerts(bot: Bot, client: httpx.AsyncClient, bankroll_a
                 logger.warning("Odds API %s -> %s | %s", sport_key, r.status_code, r.text)
 
                 if "OUT_OF_USAGE_CREDITS" in r.text and not odds_credits_alert_sent:
-                    try:
-                        await send_message(
-                            bot,
-                            "⚠️ Aviso: te quedaste sin créditos en The Odds API."
-                        )
-                        odds_credits_alert_sent = True
-                    except Exception as exc:
-                        logger.warning("No se pudo enviar alerta de créditos: %s", exc)
+                    await send_message(bot, "⚠️ Aviso: te quedaste sin créditos en The Odds API.")
+                    odds_credits_alert_sent = True
 
                 await asyncio.sleep(ODDS_API_REQUEST_DELAY)
                 continue
@@ -767,13 +719,11 @@ async def fetch_pre_match_alerts(bot: Bot, client: httpx.AsyncClient, bankroll_a
                     continue
 
                 commence_time = parse_iso_datetime(commence_time_raw)
-
                 if not should_send_prematch(commence_time):
                     continue
 
                 home_team, away_team = get_match_teams_from_odds_event(game)
                 bookmakers = game.get("bookmakers", [])
-
                 if not bookmakers:
                     continue
 
@@ -783,15 +733,11 @@ async def fetch_pre_match_alerts(bot: Bot, client: httpx.AsyncClient, bankroll_a
                     for market in bookmaker.get("markets", []):
                         if market.get("key") != "h2h":
                             continue
-
                         for outcome in market.get("outcomes", []):
                             name = outcome.get("name")
                             price = outcome.get("price")
-
-                            if not name or not isinstance(price, (int, float)):
-                                continue
-
-                            outcomes_by_name.setdefault(name, []).append(float(price))
+                            if name and isinstance(price, (int, float)):
+                                outcomes_by_name.setdefault(name, []).append(float(price))
 
                 if not outcomes_by_name:
                     continue
@@ -850,10 +796,6 @@ async def fetch_pre_match_alerts(bot: Bot, client: httpx.AsyncClient, bankroll_a
     return alerts[:MAX_PREMATCH_ALERTS_PER_CYCLE]
 
 
-# ---------------------------------------------------------------------------
-# Live statistics fetcher
-# ---------------------------------------------------------------------------
-
 async def fetch_match_stats(client: httpx.AsyncClient, fixture_id: int):
     try:
         r = await client.get(
@@ -864,7 +806,6 @@ async def fetch_match_stats(client: httpx.AsyncClient, fixture_id: int):
         )
 
         if r.status_code != 200:
-            logger.warning("Stats fixture=%s -> %s | %s", fixture_id, r.status_code, r.text)
             return None
 
         response = r.json().get("response", [])
@@ -897,7 +838,6 @@ async def fetch_live_odds(client: httpx.AsyncClient, fixture_id: int):
         )
 
         if r.status_code != 200:
-            logger.warning("Live odds fixture=%s -> %s | %s", fixture_id, r.status_code, r.text)
             return None
 
         response = r.json().get("response", [])
@@ -927,9 +867,8 @@ async def fetch_live_odds(client: httpx.AsyncClient, fixture_id: int):
         logger.warning("Error obteniendo live odds fixture=%s: %s", fixture_id, exc)
         return None
 
-
 # ---------------------------------------------------------------------------
-# Live alerts
+# Live alert generation
 # ---------------------------------------------------------------------------
 
 async def fetch_live_alerts(client: httpx.AsyncClient, bankroll_actual: float) -> list[dict]:
@@ -938,10 +877,7 @@ async def fetch_live_alerts(client: httpx.AsyncClient, bankroll_actual: float) -
     try:
         r = await client.get(
             "https://v3.football.api-sports.io/fixtures",
-            params={
-                "live": "all",
-                "timezone": "America/Mexico_City",
-            },
+            params={"live": "all", "timezone": "America/Mexico_City"},
             headers={"x-apisports-key": FOOTBALL_API_KEY},
             timeout=20,
         )
@@ -973,16 +909,13 @@ async def fetch_live_alerts(client: httpx.AsyncClient, bankroll_actual: float) -
 
             if not fixture_id or not home or not away or not minute:
                 continue
-
             if minute < LIVE_MIN_MINUTE:
                 continue
-
             if stats_requests_used >= MAX_STATS_REQUESTS_PER_CYCLE:
                 break
 
             stats_payload = await fetch_match_stats(client, fixture_id)
             stats_requests_used += 1
-
             if not stats_payload:
                 continue
 
@@ -993,7 +926,7 @@ async def fetch_live_alerts(client: httpx.AsyncClient, bankroll_actual: float) -
             home_stats = extract_live_stat_block(stats_payload["home"])
             away_stats = extract_live_stat_block(stats_payload["away"])
 
-            # GOAL probable local
+            # GOAL probable local -> prefer Over goals market for settlement
             home_goal_score, home_goal_reasons = score_goal_signal(
                 minute=minute,
                 team_stats=home_stats,
@@ -1010,8 +943,8 @@ async def fetch_live_alerts(client: httpx.AsyncClient, bankroll_actual: float) -
                 if live_odds_payload:
                     best_live = find_best_live_odd(
                         live_odds_payload,
-                        bet_names=["Next Goal", "Next Goal - 1X2", "Goals Over/Under"],
-                        labels=[home, "Over 1.5", "Over 2.5"],
+                        bet_names=["Goals Over/Under", "Over/Under"],
+                        labels=["Over 1.5", "Over 2.5", "Over 3.5"],
                     )
                     if best_live:
                         live_edge = compute_live_edge(best_live["odd"], fair_odd)
@@ -1023,65 +956,18 @@ async def fetch_live_alerts(client: httpx.AsyncClient, bankroll_actual: float) -
                 ):
                     stake = get_stake_by_score(home_goal_score, bankroll_actual)
                     alerts.append({
-                        "signal_key": build_live_key(fixture_id, minute, "goal_local"),
+                        "signal_key": build_live_key(fixture_id, minute, "goals_over"),
                         "league": league.get("name", "Liga"),
                         "home": home,
                         "away": away,
                         "minute": minute,
                         "score": f"{home_goals}-{away_goals}",
-                        "signal_type": f"Gol probable - {home}",
+                        "signal_type": "Over goles live",
                         "signal_score": home_goal_score,
                         "tier": classify_live_tier(home_goal_score),
                         "reason": ", ".join(home_goal_reasons),
                         "market_name": best_live["bet_name"] if best_live else None,
-                        "live_odd": best_live["odd"] if best_live else None,
-                        "fair_odd": fair_odd if best_live else None,
-                        "live_edge_pct": live_edge * 100 if best_live else None,
-                        "stake": stake,
-                        "fixture_id": fixture_id,
-                    })
-
-            # GOAL probable visitante
-            away_goal_score, away_goal_reasons = score_goal_signal(
-                minute=minute,
-                team_stats=away_stats,
-                opp_stats=home_stats,
-                team_goals=away_goals,
-                opp_goals=home_goals,
-            )
-
-            if away_goal_score >= LIVE_GOAL_MIN_SCORE:
-                fair_odd = estimate_fair_odds_from_score(away_goal_score, "goal")
-                best_live = None
-                live_edge = 0.0
-
-                if live_odds_payload:
-                    best_live = find_best_live_odd(
-                        live_odds_payload,
-                        bet_names=["Next Goal", "Next Goal - 1X2", "Goals Over/Under"],
-                        labels=[away, "Over 1.5", "Over 2.5"],
-                    )
-                    if best_live:
-                        live_edge = compute_live_edge(best_live["odd"], fair_odd)
-
-                if (not ENABLE_V4_LIVE_ODDS) or (
-                    best_live
-                    and LIVE_GOAL_MIN_ODDS <= best_live["odd"] <= LIVE_GOAL_MAX_ODDS
-                    and live_edge >= LIVE_ODDS_MIN_EDGE
-                ):
-                    stake = get_stake_by_score(away_goal_score, bankroll_actual)
-                    alerts.append({
-                        "signal_key": build_live_key(fixture_id, minute, "goal_visitante"),
-                        "league": league.get("name", "Liga"),
-                        "home": home,
-                        "away": away,
-                        "minute": minute,
-                        "score": f"{home_goals}-{away_goals}",
-                        "signal_type": f"Gol probable - {away}",
-                        "signal_score": away_goal_score,
-                        "tier": classify_live_tier(away_goal_score),
-                        "reason": ", ".join(away_goal_reasons),
-                        "market_name": best_live["bet_name"] if best_live else None,
+                        "market_label": best_live["label"] if best_live else None,
                         "live_odd": best_live["odd"] if best_live else None,
                         "fair_odd": fair_odd if best_live else None,
                         "live_edge_pct": live_edge * 100 if best_live else None,
@@ -1128,6 +1014,7 @@ async def fetch_live_alerts(client: httpx.AsyncClient, bankroll_actual: float) -
                         "tier": classify_live_tier(corners_score),
                         "reason": ", ".join(corners_reasons),
                         "market_name": best_live["bet_name"] if best_live else None,
+                        "market_label": best_live["label"] if best_live else None,
                         "live_odd": best_live["odd"] if best_live else None,
                         "fair_odd": fair_odd if best_live else None,
                         "live_edge_pct": live_edge * 100 if best_live else None,
@@ -1169,11 +1056,12 @@ async def fetch_live_alerts(client: httpx.AsyncClient, bankroll_actual: float) -
                         "away": away,
                         "minute": minute,
                         "score": f"{home_goals}-{away_goals}",
-                        "signal_type": "Posibles más tarjetas",
+                        "signal_type": "Over tarjetas live",
                         "signal_score": cards_score,
                         "tier": classify_live_tier(cards_score),
                         "reason": ", ".join(cards_reasons),
                         "market_name": best_live["bet_name"] if best_live else None,
+                        "market_label": best_live["label"] if best_live else None,
                         "live_odd": best_live["odd"] if best_live else None,
                         "fair_odd": fair_odd if best_live else None,
                         "live_edge_pct": live_edge * 100 if best_live else None,
@@ -1188,15 +1076,13 @@ async def fetch_live_alerts(client: httpx.AsyncClient, bankroll_actual: float) -
         logger.warning("Error en live fetch: %s", exc)
         return alerts
 
-
 # ---------------------------------------------------------------------------
-# Bet history / settlement
+# Bet entry builders
 # ---------------------------------------------------------------------------
 
 def create_prematch_bet_entry(alert: dict) -> dict:
-    bet_id = f"prematch|{alert['match_key']}"
     return {
-        "bet_id": bet_id,
+        "bet_id": f"prematch|{alert['match_key']}",
         "tipo": "prematch",
         "subtipo": "h2h",
         "fecha_alerta": now_local().isoformat(),
@@ -1214,15 +1100,21 @@ def create_prematch_bet_entry(alert: dict) -> dict:
 
 
 def create_live_bet_entry(alert: dict) -> dict:
-    bet_id = f"live|{alert['signal_key']}"
+    market_label = alert.get("market_label")
+    line = extract_line_from_label(market_label) if market_label else None
+
     return {
-        "bet_id": bet_id,
+        "bet_id": f"live|{alert['signal_key']}",
         "tipo": "live",
         "subtipo": normalize_text(alert["signal_type"]),
+        "fixture_id": alert.get("fixture_id"),
         "fecha_alerta": now_local().isoformat(),
         "league": alert["league"],
         "home_team": alert["home"],
         "away_team": alert["away"],
+        "market_name": alert.get("market_name"),
+        "market_label": market_label,
+        "line": line,
         "pick": alert["signal_type"],
         "pick_text": alert["signal_type"],
         "odd": alert.get("live_odd"),
@@ -1230,10 +1122,12 @@ def create_live_bet_entry(alert: dict) -> dict:
         "resultado": "pendiente",
         "profit": 0.0,
         "settled_at": None,
-        "fixture_id": alert.get("fixture_id"),
         "reason": alert.get("reason"),
     }
 
+# ---------------------------------------------------------------------------
+# Settlement
+# ---------------------------------------------------------------------------
 
 async def settle_prematch_bets(client: httpx.AsyncClient, history: list[dict]) -> bool:
     changed = False
@@ -1256,7 +1150,6 @@ async def settle_prematch_bets(client: httpx.AsyncClient, history: list[dict]) -
             continue
 
         date_str = alert_dt.astimezone(LOCAL_TZ).strftime("%Y-%m-%d")
-
         found_result = None
 
         for league_id in ALLOWED_LEAGUE_IDS:
@@ -1289,7 +1182,6 @@ async def settle_prematch_bets(client: httpx.AsyncClient, history: list[dict]) -
 
                     if h != home_team or a != away_team:
                         continue
-
                     if status not in {"FT", "AET", "PEN"}:
                         continue
 
@@ -1339,6 +1231,97 @@ async def settle_prematch_bets(client: httpx.AsyncClient, history: list[dict]) -
     return changed
 
 
+async def settle_live_bets(client: httpx.AsyncClient, history: list[dict]) -> bool:
+    changed = False
+
+    for bet in history:
+        if bet.get("tipo") != "live":
+            continue
+        if bet.get("resultado") != "pendiente":
+            continue
+
+        fixture_id = bet.get("fixture_id")
+        if not fixture_id:
+            continue
+
+        try:
+            r = await client.get(
+                "https://v3.football.api-sports.io/fixtures",
+                params={"id": fixture_id, "timezone": "America/Mexico_City"},
+                headers={"x-apisports-key": FOOTBALL_API_KEY},
+                timeout=20,
+            )
+
+            if r.status_code != 200:
+                continue
+
+            response = r.json().get("response", [])
+            if not response:
+                continue
+
+            match = response[0]
+            status = match.get("fixture", {}).get("status", {}).get("short")
+            if status not in {"FT", "AET", "PEN"}:
+                continue
+
+            goals = match.get("goals", {})
+            hg = goals.get("home", 0) or 0
+            ag = goals.get("away", 0) or 0
+
+            stats_payload = await fetch_match_stats(client, fixture_id)
+            if not stats_payload:
+                continue
+
+            home_stats = extract_live_stat_block(stats_payload["home"])
+            away_stats = extract_live_stat_block(stats_payload["away"])
+
+            total_goals = hg + ag
+            total_corners = home_stats["corner_kicks"] + away_stats["corner_kicks"]
+            total_cards = (
+                home_stats["yellow_cards"] + away_stats["yellow_cards"] +
+                home_stats["red_cards"] + away_stats["red_cards"]
+            )
+
+            market_name = normalize_text(bet.get("market_name"))
+            market_label = normalize_text(bet.get("market_label"))
+            line = bet.get("line")
+            odd = float(bet.get("odd") or 0.0)
+            stake = float(bet.get("stake") or 0.0)
+
+            if line is None or odd <= 1 or stake <= 0:
+                continue
+
+            won = None
+
+            if "corner" in market_name and "over" in market_label:
+                won = total_corners > line
+            elif ("card" in market_name or "booking" in market_name) and "over" in market_label:
+                won = total_cards > line
+            elif "over" in market_label and ("goal" in market_name or "over/under" in market_name):
+                won = total_goals > line
+
+            if won is None:
+                continue
+
+            if won:
+                bet["resultado"] = "ganada"
+                bet["profit"] = round(stake * (odd - 1), 2)
+            else:
+                bet["resultado"] = "perdida"
+                bet["profit"] = round(-stake, 2)
+
+            bet["settled_at"] = now_local().isoformat()
+            changed = True
+
+        except Exception as exc:
+            logger.warning("Error liquidando live fixture=%s: %s", fixture_id, exc)
+            continue
+
+    if changed:
+        save_bet_history(history)
+
+    return changed
+
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
@@ -1355,7 +1338,6 @@ async def main():
 
     bankroll_state = load_bankroll_state()
     bankroll_inicial = float(bankroll_state["bankroll_inicial"])
-
     history = load_bet_history()
 
     bot = Bot(token=BOT_TOKEN)
@@ -1386,7 +1368,6 @@ async def main():
                 history = load_bet_history()
                 bankroll_actual = current_bankroll(history, bankroll_inicial)
 
-                # Próximos partidos
                 if (current_utc - last_upcoming_scan).total_seconds() >= UPCOMING_SCAN_INTERVAL:
                     upcoming_matches = await fetch_upcoming_matches(client)
                     logger.info("Próximos partidos detectados: %s", len(upcoming_matches))
@@ -1394,14 +1375,11 @@ async def main():
                     for match in upcoming_matches:
                         if match["match_key"] in sent_upcoming_match_alerts:
                             continue
-
-                        text = format_upcoming_match_alert(match)
-                        await send_message(bot, text)
+                        await send_message(bot, format_upcoming_match_alert(match))
                         sent_upcoming_match_alerts.add(match["match_key"])
 
                     last_upcoming_scan = current_utc
 
-                # Pre-match
                 if (current_utc - last_prematch_scan).total_seconds() >= PREMATCH_SCAN_INTERVAL:
                     prematch_alerts = await fetch_pre_match_alerts(bot, client, bankroll_actual)
                     logger.info("Alertas pre-partido detectadas: %s", len(prematch_alerts))
@@ -1410,17 +1388,14 @@ async def main():
                         if alert["match_key"] in sent_pre_match_signals:
                             continue
 
-                        text = format_pre_match_alert(alert)
-                        await send_message(bot, text)
+                        await send_message(bot, format_pre_match_alert(alert))
                         sent_pre_match_signals.add(alert["match_key"])
 
-                        bet_entry = create_prematch_bet_entry(alert)
                         history = load_bet_history()
-                        register_bet(history, bet_entry)
+                        register_bet(history, create_prematch_bet_entry(alert))
 
                     last_prematch_scan = current_utc
 
-                # Live
                 if (current_utc - last_live_scan).total_seconds() >= LIVE_SCAN_INTERVAL:
                     history = load_bet_history()
                     bankroll_actual = current_bankroll(history, bankroll_inicial)
@@ -1432,21 +1407,20 @@ async def main():
                         if alert["signal_key"] in sent_live_signals:
                             continue
 
-                        text = format_live_alert(alert)
-                        await send_message(bot, text)
+                        await send_message(bot, format_live_alert(alert))
                         sent_live_signals.add(alert["signal_key"])
 
-                        bet_entry = create_live_bet_entry(alert)
                         history = load_bet_history()
-                        register_bet(history, bet_entry)
+                        register_bet(history, create_live_bet_entry(alert))
 
                     last_live_scan = current_utc
 
-                # Settlement pre-match
                 if (current_utc - last_settlement_scan).total_seconds() >= SETTLEMENT_SCAN_INTERVAL:
                     history = load_bet_history()
-                    changed = await settle_prematch_bets(client, history)
-                    if changed:
+                    changed_pre = await settle_prematch_bets(client, history)
+                    changed_live = await settle_live_bets(client, history)
+
+                    if changed_pre or changed_live:
                         summary = bankroll_summary(history, bankroll_inicial)
                         logger.info(
                             "Bets liquidadas. Profit=%s ROI=%s Bank=%s",
@@ -1454,9 +1428,9 @@ async def main():
                             summary["roi"],
                             summary["bankroll_actual"],
                         )
+
                     last_settlement_scan = current_utc
 
-                # Resumen diario
                 bankroll_state = load_bankroll_state()
                 last_summary_date = bankroll_state.get("last_daily_summary_date")
                 today_str = current_local.strftime("%Y-%m-%d")
