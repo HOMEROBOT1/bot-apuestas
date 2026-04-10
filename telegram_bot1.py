@@ -19,7 +19,6 @@ SIGNAL_COOLDOWN_MINUTES = 35
 HTTP_TIMEOUT = 30.0
 MAX_LIVE_ALERTS_PER_CYCLE = 2
 STRONG_BET_THRESHOLD = 82
-SUMMARY_HOUR_LOCAL = 23
 
 TRACKED_LEAGUE_IDS = {
     262,  # Liga MX
@@ -84,30 +83,6 @@ def db_conn():
             sent_at TEXT NOT NULL
         )
     """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS tracked_picks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            fixture_id INTEGER NOT NULL,
-            league TEXT,
-            home TEXT,
-            away TEXT,
-            market TEXT NOT NULL,
-            minute_sent INTEGER,
-            score_sent TEXT,
-            confidence INTEGER,
-            status TEXT NOT NULL DEFAULT 'pending',
-            result TEXT,
-            created_at TEXT NOT NULL,
-            resolved_at TEXT,
-            summary_date TEXT
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS meta_state (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        )
-    """)
     conn.commit()
     return conn
 
@@ -148,83 +123,6 @@ def cleanup_cache():
     old_keys = [k for k, ts in sent_cache.items() if now - ts > timedelta(hours=12)]
     for k in old_keys:
         del sent_cache[k]
-
-def track_pick(sig: dict):
-    conn = db_conn()
-    conn.execute("""
-        INSERT INTO tracked_picks(
-            fixture_id, league, home, away, market, minute_sent, score_sent,
-            confidence, status, created_at
-        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
-    """, (
-        sig["fixture_id"],
-        sig["league"],
-        sig["home"],
-        sig["away"],
-        sig["market"],
-        sig["minute"],
-        sig["score"],
-        sig["confidence"],
-        datetime.now(timezone.utc).isoformat()
-    ))
-    conn.commit()
-    conn.close()
-
-def get_pending_picks():
-    conn = db_conn()
-    rows = conn.execute("""
-        SELECT id, fixture_id, league, home, away, market, minute_sent, score_sent,
-               confidence, created_at
-        FROM tracked_picks
-        WHERE status = 'pending'
-        ORDER BY created_at ASC
-    """).fetchall()
-    conn.close()
-    return rows
-
-def resolve_pick(pick_id: int, result: str):
-    conn = db_conn()
-    summary_date = datetime.now().strftime("%Y-%m-%d")
-    conn.execute("""
-        UPDATE tracked_picks
-        SET status = 'resolved',
-            result = ?,
-            resolved_at = ?,
-            summary_date = ?
-        WHERE id = ?
-    """, (
-        result,
-        datetime.now(timezone.utc).isoformat(),
-        summary_date,
-        pick_id
-    ))
-    conn.commit()
-    conn.close()
-
-def get_meta(key: str):
-    conn = db_conn()
-    row = conn.execute("SELECT value FROM meta_state WHERE key = ?", (key,)).fetchone()
-    conn.close()
-    return row[0] if row else None
-
-def set_meta(key: str, value: str):
-    conn = db_conn()
-    conn.execute("""
-        INSERT OR REPLACE INTO meta_state(key, value) VALUES(?, ?)
-    """, (key, value))
-    conn.commit()
-    conn.close()
-
-def get_daily_results(summary_date: str):
-    conn = db_conn()
-    rows = conn.execute("""
-        SELECT market, result, confidence, league, home, away
-        FROM tracked_picks
-        WHERE summary_date = ?
-        ORDER BY resolved_at ASC
-    """, (summary_date,)).fetchall()
-    conn.close()
-    return rows
 
 # =========================================================
 # UTILS
@@ -275,16 +173,12 @@ def market_family(market: str) -> str:
         return "corners"
     if "tarjetas" in m:
         return "cards"
-    if "partido caliente" in m:
-        return "hot_match"
     return "other"
 
 def signal_priority(sig: dict) -> int:
     bonus = 0
     if sig["market"] in {"Over 1.5", "Over 2.5"}:
         bonus += 6
-    if sig["market"] == "Partido Caliente":
-        bonus -= 4
     if sig["confidence"] >= STRONG_BET_THRESHOLD:
         bonus += 8
     return sig["confidence"] + bonus
@@ -331,14 +225,6 @@ async def get_fixture_stats(fixture_id: int):
         params={"fixture": fixture_id},
     )
     return data.get("response", [])
-
-async def get_fixture_by_id(fixture_id: int):
-    data = await football_api_get(
-        "/fixtures",
-        params={"id": fixture_id, "timezone": TIMEZONE},
-    )
-    response = data.get("response", [])
-    return response[0] if response else None
 
 def build_team_stats(stats_resp: list[dict]):
     if len(stats_resp) < 2:
@@ -419,6 +305,7 @@ def evaluate_live_signal(fx: dict, home_stats: dict, away_stats: dict):
 
     candidates = []
 
+    # OVER 1.5
     conf_over15 = 0
     if 18 <= elapsed <= 68:
         conf_over15 += 10
@@ -436,6 +323,7 @@ def evaluate_live_signal(fx: dict, home_stats: dict, away_stats: dict):
         conf_over15 += 20
     if home_stats["shots_on"] >= 3 or away_stats["shots_on"] >= 3:
         conf_over15 += 10
+
     if conf_over15 >= 72 and total_goals <= 1:
         candidates.append({
             "market": "Over 1.5",
@@ -443,6 +331,7 @@ def evaluate_live_signal(fx: dict, home_stats: dict, away_stats: dict):
             "reason": "Ritmo ofensivo alto y buena lectura para un gol más",
         })
 
+    # OVER 2.5
     conf_over25 = 0
     if 22 <= elapsed <= 64:
         conf_over25 += 10
@@ -458,6 +347,7 @@ def evaluate_live_signal(fx: dict, home_stats: dict, away_stats: dict):
         conf_over25 += 10
     if pressure_score >= 36:
         conf_over25 += 20
+
     if conf_over25 >= 78 and total_goals <= 2:
         candidates.append({
             "market": "Over 2.5",
@@ -465,6 +355,7 @@ def evaluate_live_signal(fx: dict, home_stats: dict, away_stats: dict):
             "reason": "El partido trae ritmo fuerte para otra anotación",
         })
 
+    # UNDER 3.5
     conf_under35 = 0
     if elapsed >= 24:
         conf_under35 += 8
@@ -478,6 +369,7 @@ def evaluate_live_signal(fx: dict, home_stats: dict, away_stats: dict):
         conf_under35 += 22
     if total_red > 0:
         conf_under35 -= 10
+
     if conf_under35 >= 74 and total_goals <= 2 and pressure_score < 20:
         candidates.append({
             "market": "Under 3.5",
@@ -485,6 +377,7 @@ def evaluate_live_signal(fx: dict, home_stats: dict, away_stats: dict):
             "reason": "Partido muy cerrado y con ritmo bajo",
         })
 
+    # OVER 8.5 CÓRNERS
     conf_corners = 0
     if 28 <= elapsed <= 76:
         conf_corners += 8
@@ -496,6 +389,7 @@ def evaluate_live_signal(fx: dict, home_stats: dict, away_stats: dict):
         conf_corners += 10
     if pressure_score >= 32:
         conf_corners += 16
+
     if conf_corners >= 72 and total_corners <= 8:
         candidates.append({
             "market": "Over 8.5 córners",
@@ -503,6 +397,7 @@ def evaluate_live_signal(fx: dict, home_stats: dict, away_stats: dict):
             "reason": "La dinámica del juego sigue empujando más córners",
         })
 
+    # OVER 3.5 TARJETAS
     conf_cards = 0
     if 28 <= elapsed <= 84:
         conf_cards += 8
@@ -514,31 +409,12 @@ def evaluate_live_signal(fx: dict, home_stats: dict, away_stats: dict):
         conf_cards += 16
     if pressure_score >= 26:
         conf_cards += 8
+
     if conf_cards >= 68 and (total_yellow + total_red) <= 4:
         candidates.append({
             "market": "Over 3.5 tarjetas",
             "confidence": min(conf_cards, 95),
             "reason": "La intensidad del partido favorece más amonestaciones",
-        })
-
-    conf_hot = 0
-    if 20 <= elapsed <= 72:
-        conf_hot += 10
-    if total_shots_on >= 7:
-        conf_hot += 28
-    if total_corners >= 6:
-        conf_hot += 16
-    if pressure_score >= 38:
-        conf_hot += 26
-    if total_goals >= 1:
-        conf_hot += 8
-    if total_yellow >= 2:
-        conf_hot += 8
-    if conf_hot >= 82:
-        candidates.append({
-            "market": "Partido Caliente",
-            "confidence": min(conf_hot, 95),
-            "reason": "Partido con mucho ritmo, ideal para monitorear entrada live",
         })
 
     if not candidates:
@@ -603,141 +479,11 @@ def build_live_keys(sig: dict):
 
     exact_key = f"live_exact:{fixture_id}:{market}:{score}"
     family_key = f"live_family:{fixture_id}:{family}"
+    match_key = f"live_match:{fixture_id}"
     window_key = f"live_window:{fixture_id}:{minute_bucket}"
     strong_key = f"live_strong:{fixture_id}:{market}"
 
-    return exact_key, family_key, window_key, strong_key
-
-# =========================================================
-# PICK RESULT EVALUATION
-# =========================================================
-
-def parse_score(score_text: str):
-    parts = score_text.split("-")
-    if len(parts) != 2:
-        return 0, 0
-    return safe_int(parts[0]), safe_int(parts[1])
-
-def evaluate_pick_result(market: str, final_home: int, final_away: int, fx: dict) -> str:
-    total_goals = final_home + final_away
-    league = fx.get("league", {})
-    fixture = fx.get("fixture", {})
-    events_info = fixture.get("status", {})
-
-    if market == "Over 1.5":
-        return "win" if total_goals >= 2 else "loss"
-
-    if market == "Over 2.5":
-        return "win" if total_goals >= 3 else "loss"
-
-    if market == "Under 3.5":
-        return "win" if total_goals <= 3 else "loss"
-
-    if market == "Over 8.5 córners":
-        # si la API no trae corners finales aquí, la dejamos como void
-        return "void"
-
-    if market == "Over 3.5 tarjetas":
-        return "void"
-
-    if market == "Partido Caliente":
-        # se toma como informativa, no win/loss
-        return "void"
-
-    return "void"
-
-async def resolve_finished_picks():
-    pending = get_pending_picks()
-    if not pending:
-        return
-
-    resolved_count = 0
-
-    for row in pending:
-        pick_id, fixture_id, league, home, away, market, minute_sent, score_sent, confidence, created_at = row
-
-        try:
-            fx = await get_fixture_by_id(fixture_id)
-        except Exception as e:
-            logging.exception("Error consultando fixture %s para resolver pick: %s", fixture_id, e)
-            continue
-
-        if not fx:
-            continue
-
-        status = (fx.get("fixture", {}).get("status", {}) or {}).get("short", "")
-        if status not in {"FT", "AET", "PEN", "CANC", "ABD", "AWD", "WO"}:
-            continue
-
-        if status in {"CANC", "ABD", "AWD", "WO"}:
-            result = "void"
-        else:
-            goals = fx.get("goals", {})
-            final_home = safe_int(goals.get("home"))
-            final_away = safe_int(goals.get("away"))
-            result = evaluate_pick_result(market, final_home, final_away, fx)
-
-        resolve_pick(pick_id, result)
-        resolved_count += 1
-
-        emoji = "✅" if result == "win" else "❌" if result == "loss" else "➖"
-        result_text = "GANADA" if result == "win" else "PERDIDA" if result == "loss" else "ANULADA"
-
-        msg = (
-            f"{emoji} Resultado Pick\n\n"
-            f"🏆 Liga: {league}\n"
-            f"⚽ {home} vs {away}\n"
-            f"🎯 Mercado: {market}\n"
-            f"🔥 Confianza enviada: {fmt_conf(confidence)} ({confidence}/100)\n"
-            f"📌 Resultado: {result_text}"
-        )
-        await send_telegram(msg)
-
-    logging.info("Picks resueltos en este ciclo: %s", resolved_count)
-
-# =========================================================
-# DAILY SUMMARY
-# =========================================================
-
-async def maybe_send_daily_summary():
-    now_local = datetime.now()
-    today = now_local.strftime("%Y-%m-%d")
-    current_hour = now_local.hour
-
-    if current_hour < SUMMARY_HOUR_LOCAL:
-        return
-
-    last_sent_for = get_meta("last_daily_summary_date")
-    if last_sent_for == today:
-        return
-
-    rows = get_daily_results(today)
-    if not rows:
-        set_meta("last_daily_summary_date", today)
-        return
-
-    wins = sum(1 for r in rows if r[1] == "win")
-    losses = sum(1 for r in rows if r[1] == "loss")
-    voids = sum(1 for r in rows if r[1] == "void")
-    total = len(rows)
-
-    lines = []
-    for market, result, confidence, league, home, away in rows[:10]:
-        emoji = "✅" if result == "win" else "❌" if result == "loss" else "➖"
-        lines.append(f"{emoji} {market} | {home} vs {away} | {confidence}/100")
-
-    msg = (
-        f"📘 Resumen diario de picks\n\n"
-        f"📅 Fecha: {today}\n"
-        f"📊 Total resueltos: {total}\n"
-        f"✅ Ganadas: {wins}\n"
-        f"❌ Perdidas: {losses}\n"
-        f"➖ Anuladas: {voids}\n\n"
-        f"Detalle:\n" + "\n".join(lines)
-    )
-
-    await send_telegram(msg)
-    set_meta("last_daily_summary_date", today)
+    return exact_key, family_key, match_key, window_key, strong_key
 
 # =========================================================
 # LIVE CHECK
@@ -785,11 +531,13 @@ async def check_live_matches():
         if not sig:
             continue
 
-        exact_key, family_key, window_key, strong_key = build_live_keys(sig)
+        exact_key, family_key, match_key, window_key, strong_key = build_live_keys(sig)
 
         if exact_key in last_cycle_sent or was_sent_recently(exact_key, SIGNAL_COOLDOWN_MINUTES):
             continue
         if family_key in last_cycle_sent or was_sent_recently(family_key, SIGNAL_COOLDOWN_MINUTES):
+            continue
+        if match_key in last_cycle_sent or was_sent_recently(match_key, SIGNAL_COOLDOWN_MINUTES):
             continue
         if window_key in last_cycle_sent or was_sent_recently(window_key, LIVE_LOOKBACK_MINUTES):
             continue
@@ -803,19 +551,20 @@ async def check_live_matches():
     selected = candidates_to_send[:MAX_LIVE_ALERTS_PER_CYCLE]
 
     for sig in selected:
-        exact_key, family_key, window_key, strong_key = build_live_keys(sig)
+        exact_key, family_key, match_key, window_key, strong_key = build_live_keys(sig)
 
         await send_telegram(format_live_signal(sig))
-        track_pick(sig)
 
         mark_sent(exact_key)
         mark_sent(family_key)
+        mark_sent(match_key)
         mark_sent(window_key)
         if sig["confidence"] >= STRONG_BET_THRESHOLD:
             mark_sent(strong_key)
 
         last_cycle_sent.add(exact_key)
         last_cycle_sent.add(family_key)
+        last_cycle_sent.add(match_key)
         last_cycle_sent.add(window_key)
         if sig["confidence"] >= STRONG_BET_THRESHOLD:
             last_cycle_sent.add(strong_key)
@@ -836,9 +585,7 @@ async def run_cycle():
     cleanup_cache()
 
     logging.info("========== NUEVO CICLO ==========")
-    await resolve_finished_picks()
     await check_live_matches()
-    await maybe_send_daily_summary()
 
 async def main():
     logging.info("Bot iniciado")
