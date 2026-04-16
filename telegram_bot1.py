@@ -826,13 +826,12 @@ async def build_signal_for_game(
 
     picks, total = combo
     return picks, total, intel
-
 async def run_cycle() -> bool:
     """
     Devuelve True si debe dormir hasta mañana.
     Devuelve False si debe seguir en ciclos normales.
     """
-    global last_no_fixtures_alert_date
+    global last_no_fixtures_alert_date, last_fixtures_found_alert_date
 
     logger.info("Iniciando ciclo V13.2 PRO...")
     sent_count = 0
@@ -849,10 +848,9 @@ async def run_cycle() -> bool:
 
     async with httpx.AsyncClient() as client:
         games = await collect_upcoming_games(client)
+        today_str = now_local().strftime("%Y-%m-%d")
 
         if not games:
-            today_str = now_local().strftime("%Y-%m-%d")
-
             if SEND_NO_FIXTURES_MESSAGE and last_no_fixtures_alert_date != today_str:
                 msg = (
                     "📅 Hoy no encontré partidos en tus ligas configuradas "
@@ -864,6 +862,31 @@ async def run_cycle() -> bool:
 
             logger.info("No hay partidos en ventana. El bot dormirá hasta mañana.")
             return True
+
+        # Aviso de que sí hay partidos hoy, solo una vez por día
+        if last_fixtures_found_alert_date != today_str:
+            unique_matches = []
+            seen_ids = set()
+
+            for game in games:
+                gid = game.get("id")
+                if gid in seen_ids:
+                    continue
+                seen_ids.add(gid)
+                unique_matches.append(
+                    f"• {fixture_name(game)} — {format_local_time(game['commence_time'])}"
+                )
+
+            preview = "\n".join(unique_matches[:8])
+
+            msg = (
+                "📅 Sí encontré partidos para hoy en tus ligas configuradas.\n\n"
+                "👀 Estaré analizando previas y si encuentro buenos parleys o señales prepartido te los mando.\n\n"
+                "Partidos detectados:\n"
+                f"{preview}"
+            )
+            await send_text(msg)
+            last_fixtures_found_alert_date = today_str
 
         games = games[:MAX_EVENTS_TO_DEEP_SCAN_PER_CYCLE]
 
