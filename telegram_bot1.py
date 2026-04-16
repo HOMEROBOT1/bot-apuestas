@@ -23,6 +23,9 @@ import httpx
 from telegram import Bot
 from telegram.error import TelegramError
 
+import os
+
+print("DEBUG ENV:", os.environ)
 # =========================================================
 # LOGGING
 # =========================================================
