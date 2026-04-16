@@ -1,29 +1,19 @@
 """
-V12 PRO PREMATCH - Telegram Betting Bot
----------------------------------------
-Enfoque:
-- Prioridad total a señales PREPARTIDO
-- Construye combinadas automáticas de 2 o 3 picks
-- Usa The Odds API V4
-- Mercados base por liga:
-    * h2h
-    * totals
-    * btts
-- Mercados extra por evento:
-    * double_chance
-    * alternate_totals_corners
-    * alternate_totals_cards
+V13 PRO INTELIGENTE - Telegram Betting Bot
+------------------------------------------
+Usa:
+- The Odds API -> cuotas y mercados reales
+- API-Football -> inteligencia previa (predictions)
 
-Notas:
-- Los mercados adicionales deben consultarse uno por evento usando
-  /v4/sports/{sport}/events/{eventId}/odds
-- Esto consume más créditos, así que el bot filtra por ventana horaria
-  y máximo de partidos por ciclo.
+Objetivo:
+- Prioridad total a señales PREPARTIDO
+- Construir picks más lógicos antes de usar cuotas
+- Combinar 2 o 3 selecciones
+- Evitar duplicados
 """
 
 import asyncio
 import logging
-import math
 import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -41,25 +31,28 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
-logger = logging.getLogger("v12_prematch")
+logger = logging.getLogger("v13_pro")
 
 # =========================================================
-# ENV VARS
+# VARIABLES DE ENTORNO
 # =========================================================
 
 BOT_TOKEN = os.getenv("8713741185:AAFqvoZ0Ji3xWw2FsA8BuMslfCGhQ0tMzCQ", "").strip()
 CHAT_ID = os.getenv("1983622390", "").strip()
 ODDS_API_KEY = os.getenv("92f3a8c48fe9834c7b1e6bbf38346064", "").strip()
+API_FOOTBALL_KEY = os.getenv("c455630d0023ef208f93dd0567164905", "").strip()
 
 if not BOT_TOKEN:
-    raise ValueError("Falta BOT_TOKEN en variables de entorno.")
+    raise ValueError("Falta BOT_TOKEN")
 if not CHAT_ID:
-    raise ValueError("Falta CHAT_ID en variables de entorno.")
+    raise ValueError("Falta CHAT_ID")
 if not ODDS_API_KEY:
-    raise ValueError("Falta ODDS_API_KEY en variables de entorno.")
+    raise ValueError("Falta ODDS_API_KEY")
+if not API_FOOTBALL_KEY:
+    raise ValueError("Falta API_FOOTBALL_KEY")
 
 # =========================================================
-# CONFIG GENERAL
+# CONFIG
 # =========================================================
 
 TZ = ZoneInfo("America/Mexico_City")
@@ -70,40 +63,27 @@ LEAGUES = [
     "soccer_uefa_champs_league",
 ]
 
-# Cada cuánto revisa
-SCAN_INTERVAL_SECONDS = 900  # 15 min
+# Mapeo a API-Football
+API_FOOTBALL_LEAGUE_MAP = {
+    "soccer_mexico_ligamx": {"league_id": 262, "season": 2025},
+    "soccer_epl": {"league_id": 39, "season": 2025},
+    "soccer_uefa_champs_league": {"league_id": 2, "season": 2025},
+}
 
-# Solo revisar partidos que inicien dentro de esta ventana
+SCAN_INTERVAL_SECONDS = 900
 PREMATCH_WINDOW_HOURS = 18
-
-# Limita cuántos partidos va a profundizar por ciclo para ahorrar créditos
 MAX_EVENTS_TO_DEEP_SCAN_PER_CYCLE = 8
-
-# Regiones a consultar
-ODDS_REGION = "uk"
-
-# Endpoint general: mercados destacados/más baratos
-BASE_MARKETS = "h2h,totals,btts"
-
-# Endpoint por evento: mercados extra
-EVENT_MARKETS = "double_chance,alternate_totals_corners,alternate_totals_cards"
-
-# Rango de cuota individual permitido
-MIN_PICK_ODDS = 1.30
-MAX_PICK_ODDS = 2.20
-
-# Rango de cuota total de la combinada
-MIN_COMBINED_ODDS = 2.00
-MAX_COMBINED_ODDS = 4.50
-
-# Máximo picks por señal
-MIN_LEGS = 2
-MAX_LEGS = 3
-
-# Para no saturar
 MAX_MESSAGES_PER_CYCLE = 3
 
-# Preferencias de líneas
+ODDS_REGION = "uk"
+BASE_MARKETS = "h2h,totals,btts"
+EVENT_MARKETS = "double_chance,alternate_totals_corners,alternate_totals_cards"
+
+MIN_PICK_ODDS = 1.30
+MAX_PICK_ODDS = 2.20
+MIN_COMBO_ODDS = 2.00
+MAX_COMBO_ODDS = 4.50
+
 PREFERRED_GOAL_LINES = [
     ("Under", 3.5),
     ("Over", 1.5),
@@ -122,7 +102,6 @@ PREFERRED_CARDS_LINES = [
     ("Over", 5.5),
 ]
 
-# Si quieres desactivar por completo live en tu estructura vieja:
 ENABLE_LIVE_SIGNALS = False
 
 # =========================================================
@@ -130,12 +109,7 @@ ENABLE_LIVE_SIGNALS = False
 # =========================================================
 
 bot = Bot(token=BOT_TOKEN)
-
-# Dedupe en memoria
 sent_signal_keys = set()
-
-# Para evitar alertar lo mismo de créditos en cada ciclo
-credits_alert_sent = False
 
 # =========================================================
 # HELPERS
@@ -152,21 +126,20 @@ def format_local_time(dt_str: str) -> str:
     return dt.strftime("%d/%m %I:%M %p")
 
 def is_within_window(commence_time: str, hours: int) -> bool:
-    start = parse_dt(commence_time)
-    diff = (start - now_utc()).total_seconds()
+    diff = (parse_dt(commence_time) - now_utc()).total_seconds()
     return 0 < diff <= hours * 3600
 
 def valid_pick_odds(price: float) -> bool:
     return MIN_PICK_ODDS <= price <= MAX_PICK_ODDS
 
 def combo_odds(picks: List[Dict[str, Any]]) -> float:
-    result = 1.0
+    total = 1.0
     for p in picks:
-        result *= float(p["odds"])
-    return round(result, 2)
+        total *= float(p["odds"])
+    return round(total, 2)
 
 def valid_combo_odds(price: float) -> bool:
-    return MIN_COMBINED_ODDS <= price <= MAX_COMBINED_ODDS
+    return MIN_COMBO_ODDS <= price <= MAX_COMBO_ODDS
 
 def safe_float(value: Any) -> Optional[float]:
     try:
@@ -174,20 +147,14 @@ def safe_float(value: Any) -> Optional[float]:
     except Exception:
         return None
 
-def compact_team_name(name: str) -> str:
-    return (name or "").strip()
-
 def fixture_name(game: Dict[str, Any]) -> str:
-    return f"{compact_team_name(game.get('home_team', 'Local'))} vs {compact_team_name(game.get('away_team', 'Visitante'))}"
+    return f"{game.get('home_team', 'Local')} vs {game.get('away_team', 'Visitante')}"
 
-def signal_dedupe_key(game: Dict[str, Any], picks: List[Dict[str, Any]]) -> str:
+def dedupe_key(game: Dict[str, Any], picks: List[Dict[str, Any]]) -> str:
     labels = "|".join(sorted([p["label"] for p in picks]))
     return f"{game.get('id', 'noid')}::{labels}"
 
 def market_outcomes_by_key(bookmakers: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-    """
-    Combina outcomes por market key tomando múltiples bookmakers.
-    """
     merged: Dict[str, List[Dict[str, Any]]] = {}
     for book in bookmakers or []:
         for market in book.get("markets", []):
@@ -207,9 +174,6 @@ def pick_best_outcome(
     name: Optional[str] = None,
     point: Optional[float] = None
 ) -> Optional[Dict[str, Any]]:
-    """
-    Devuelve el outcome con mejor precio para un nombre y punto dado.
-    """
     candidates = []
     for o in outcomes:
         if name is not None and str(o.get("name")) != str(name):
@@ -228,117 +192,6 @@ def pick_best_outcome(
 
     return max(candidates, key=lambda x: safe_float(x.get("price")) or 0.0)
 
-def implied_probability(decimal_odds: float) -> float:
-    if decimal_odds <= 0:
-        return 0.0
-    return 1.0 / decimal_odds
-
-def score_pick(pick: Dict[str, Any]) -> float:
-    """
-    Score simple para ordenar picks:
-    - premia cuotas razonables
-    - premia picks que suelen ser más "seguros" dentro del rango
-    """
-    odds = float(pick["odds"])
-    market = pick.get("market", "")
-
-    base = 100.0
-
-    # Centro preferido alrededor de 1.45 - 1.85
-    base -= abs(odds - 1.65) * 20
-
-    # Prioridades
-    if market == "double_chance":
-        base += 10
-    elif market == "totals_goals":
-        base += 9
-    elif market == "btts":
-        base += 7
-    elif market == "cards":
-        base += 6
-    elif market == "corners":
-        base += 5
-    elif market == "h2h":
-        base += 3
-
-    # Penaliza picks muy justitos
-    if odds < 1.35:
-        base -= 8
-    if odds > 2.10:
-        base -= 10
-
-    return round(base, 2)
-
-def picks_conflict(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
-    """
-    Evita combinaciones absurdas o duplicadas.
-    """
-    la = a["label"].lower()
-    lb = b["label"].lower()
-
-    # mismo pick
-    if la == lb:
-        return True
-
-    # under/over contradictorios de goles
-    if "under 3.5 goles" in la and "over 2.5 goles" in lb:
-        return False  # esta sí puede coexistir
-    if "under 3.5 goles" in lb and "over 2.5 goles" in la:
-        return False
-
-    # ambos anotan vs ambos no anotan
-    if ("ambos anotan" in la and "ambos no anotan" in lb) or ("ambos anotan" in lb and "ambos no anotan" in la):
-        return True
-
-    # ganador directo del mismo equipo con doble oportunidad redundante
-    if ("gana" in la and "o empate" in lb) or ("gana" in lb and "o empate" in la):
-        # no siempre es contradicción, pero la evitamos por redundancia
-        return True
-
-    # dos picks iguales del mismo mercado con líneas distintas muy redundantes
-    if a.get("market") == b.get("market") and a.get("market") in {"cards", "corners"}:
-        return True
-
-    if a.get("market") == b.get("market") and a.get("market") in {"double_chance"}:
-        return True
-
-    return False
-
-def combo_is_coherent(picks: List[Dict[str, Any]]) -> bool:
-    for i in range(len(picks)):
-        for j in range(i + 1, len(picks)):
-            if picks_conflict(picks[i], picks[j]):
-                return False
-    return True
-
-def pretty_pick_line(pick: Dict[str, Any]) -> str:
-    return f"- {pick['label']} @ {pick['odds']:.2f}"
-
-def format_signal_message(game: Dict[str, Any], picks: List[Dict[str, Any]], total_price: float) -> str:
-    match_name = fixture_name(game)
-    local_time = format_local_time(game["commence_time"])
-    league = game.get("sport_title", game.get("sport_key", ""))
-
-    lines = []
-    lines.append("📊 SEÑAL PREPARTIDO")
-    lines.append("")
-    lines.append(f"🏟 Partido: {match_name}")
-    lines.append(f"🏆 Liga: {league}")
-    lines.append(f"🕒 Hora: {local_time}")
-    lines.append("")
-    lines.append("✅ Picks:")
-    for pick in picks:
-        lines.append(pretty_pick_line(pick))
-    lines.append("")
-    lines.append(f"🎯 Cuota combinada: {total_price:.2f}")
-    lines.append("")
-    lines.append("🧠 Motivo:")
-    for pick in picks:
-        lines.append(f"• {pick['reason_es']}")
-    lines.append("")
-    lines.append("💰 Stake sugerido: 0.5u a 1u")
-    return "\n".join(lines)
-
 # =========================================================
 # HTTP
 # =========================================================
@@ -346,53 +199,34 @@ def format_signal_message(game: Dict[str, Any], picks: List[Dict[str, Any]], tot
 async def fetch_json(
     client: httpx.AsyncClient,
     url: str,
-    params: Dict[str, Any]
+    params: Optional[Dict[str, Any]] = None,
+    headers: Optional[Dict[str, str]] = None,
 ) -> Tuple[Optional[Any], Dict[str, str]]:
     try:
-        response = await client.get(url, params=params, timeout=30.0)
-        headers = {k: v for k, v in response.headers.items()}
-
-        if response.status_code == 429:
-            logger.warning("Rate limit alcanzado (429).")
-            return None, headers
-
+        response = await client.get(url, params=params, headers=headers, timeout=30.0)
         response.raise_for_status()
-
-        data = response.json()
-        return data, headers
-
+        return response.json(), dict(response.headers)
     except httpx.HTTPStatusError as e:
-        logger.error("HTTP error %s en %s | %s", e.response.status_code, url, e.response.text[:500])
-        return None, {}
+        logger.error("HTTP %s en %s | %s", e.response.status_code, url, e.response.text[:500])
+        return None, dict(getattr(e.response, "headers", {}))
     except Exception as e:
-        logger.exception("Error al consultar %s: %s", url, e)
+        logger.exception("Error consultando %s: %s", url, e)
         return None, {}
 
-def read_remaining_credits(headers: Dict[str, str]) -> Optional[str]:
-    """
-    The Odds API suele devolver info de créditos en headers.
-    El nombre exacto puede variar por entorno; intentamos varios.
-    """
-    for key in [
-        "x-requests-remaining",
-        "X-Requests-Remaining",
-        "x-requests-used",
-        "X-Requests-Used",
-        "x-requests-last",
-        "X-Requests-Last",
-    ]:
-        if key in headers:
-            return str(headers[key])
-    return None
+def read_odds_headers(headers: Dict[str, str]) -> None:
+    remaining = headers.get("x-requests-remaining") or headers.get("X-Requests-Remaining")
+    used = headers.get("x-requests-used") or headers.get("X-Requests-Used")
+    if remaining or used:
+        logger.info("Odds API | remaining=%s used=%s", remaining, used)
 
 # =========================================================
-# ODDS API
+# THE ODDS API
 # =========================================================
 
 async def get_upcoming_odds_for_league(
     client: httpx.AsyncClient,
     sport_key: str
-) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
+) -> List[Dict[str, Any]]:
     url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
     params = {
         "apiKey": ODDS_API_KEY,
@@ -400,16 +234,15 @@ async def get_upcoming_odds_for_league(
         "markets": BASE_MARKETS,
         "oddsFormat": "decimal",
     }
-    data, headers = await fetch_json(client, url, params)
-    if not isinstance(data, list):
-        return [], headers
-    return data, headers
+    data, headers = await fetch_json(client, url, params=params)
+    read_odds_headers(headers)
+    return data if isinstance(data, list) else []
 
 async def get_event_extra_markets(
     client: httpx.AsyncClient,
     sport_key: str,
     event_id: str
-) -> Tuple[Optional[Dict[str, Any]], Dict[str, str]]:
+) -> Optional[Dict[str, Any]]:
     url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/events/{event_id}/odds"
     params = {
         "apiKey": ODDS_API_KEY,
@@ -417,13 +250,225 @@ async def get_event_extra_markets(
         "markets": EVENT_MARKETS,
         "oddsFormat": "decimal",
     }
-    data, headers = await fetch_json(client, url, params)
-    if not isinstance(data, dict):
-        return None, headers
-    return data, headers
+    data, headers = await fetch_json(client, url, params=params)
+    read_odds_headers(headers)
+    return data if isinstance(data, dict) else None
 
 # =========================================================
-# PICK BUILDERS
+# API-FOOTBALL
+# =========================================================
+
+API_FOOTBALL_BASE = "https://v3.football.api-sports.io"
+
+def api_football_headers() -> Dict[str, str]:
+    return {
+        "x-apisports-key": API_FOOTBALL_KEY
+    }
+
+async def find_fixture_id_api_football(
+    client: httpx.AsyncClient,
+    league_id: int,
+    season: int,
+    home_team: str,
+    away_team: str,
+    event_dt: str
+) -> Optional[int]:
+    """
+    Busca fixture cercano por liga/temporada/fecha aproximada.
+    """
+    date_str = parse_dt(event_dt).astimezone(TZ).strftime("%Y-%m-%d")
+    url = f"{API_FOOTBALL_BASE}/fixtures"
+    params = {
+        "league": league_id,
+        "season": season,
+        "date": date_str,
+    }
+
+    data, _ = await fetch_json(client, url, params=params, headers=api_football_headers())
+    if not isinstance(data, dict):
+        return None
+
+    response = data.get("response", []) or []
+    if not response:
+        return None
+
+    home_lower = home_team.lower().strip()
+    away_lower = away_team.lower().strip()
+
+    for item in response:
+        teams = item.get("teams", {})
+        home = teams.get("home", {}).get("name", "").lower().strip()
+        away = teams.get("away", {}).get("name", "").lower().strip()
+
+        if home == home_lower and away == away_lower:
+            return item.get("fixture", {}).get("id")
+
+    # fallback flexible
+    for item in response:
+        teams = item.get("teams", {})
+        home = teams.get("home", {}).get("name", "").lower().strip()
+        away = teams.get("away", {}).get("name", "").lower().strip()
+
+        if home_lower in home or home in home_lower:
+            if away_lower in away or away in away_lower:
+                return item.get("fixture", {}).get("id")
+
+    return None
+
+async def get_prediction_api_football(
+    client: httpx.AsyncClient,
+    fixture_id: int
+) -> Optional[Dict[str, Any]]:
+    url = f"{API_FOOTBALL_BASE}/predictions"
+    params = {"fixture": fixture_id}
+    data, _ = await fetch_json(client, url, params=params, headers=api_football_headers())
+
+    if not isinstance(data, dict):
+        return None
+
+    response = data.get("response", []) or []
+    if not response:
+        return None
+
+    return response[0]
+
+# =========================================================
+# INTELIGENCIA API-FOOTBALL
+# =========================================================
+
+def extract_prediction_signals(pred: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Saca señales útiles del endpoint predictions.
+    """
+    result = {
+        "winner_name": None,
+        "winner_comment": None,
+        "advice": None,
+        "goals_home": None,
+        "goals_away": None,
+        "under_over": None,
+        "percent_home": None,
+        "percent_draw": None,
+        "percent_away": None,
+    }
+
+    if not pred:
+        return result
+
+    predictions = pred.get("predictions", {}) or {}
+    winner = predictions.get("winner", {}) or {}
+    goals = predictions.get("goals", {}) or {}
+    percent = predictions.get("percent", {}) or {}
+
+    result["winner_name"] = winner.get("name")
+    result["winner_comment"] = winner.get("comment")
+    result["advice"] = predictions.get("advice")
+    result["goals_home"] = goals.get("home")
+    result["goals_away"] = goals.get("away")
+    result["under_over"] = predictions.get("under_over")
+    result["percent_home"] = percent.get("home")
+    result["percent_draw"] = percent.get("draw")
+    result["percent_away"] = percent.get("away")
+
+    return result
+
+def prediction_boost_for_pick(pick: Dict[str, Any], intel: Dict[str, Any], home_team: str, away_team: str) -> float:
+    """
+    Sube o baja score del pick según la predicción.
+    """
+    score = 0.0
+    label = pick["label"].lower()
+
+    advice = (intel.get("advice") or "").lower()
+    winner_name = (intel.get("winner_name") or "").lower()
+    under_over = str(intel.get("under_over") or "").lower()
+
+    home_lower = home_team.lower()
+    away_lower = away_team.lower()
+
+    # Ganador / doble oportunidad
+    if home_lower in label and winner_name == home_lower:
+        score += 12
+    if away_lower in label and winner_name == away_lower:
+        score += 12
+
+    if "o empate" in label:
+        if home_lower in label and winner_name == home_lower:
+            score += 10
+        if away_lower in label and winner_name == away_lower:
+            score += 10
+
+    # Under/over goles
+    if "under 3.5 goles" in label:
+        if "under" in under_over:
+            score += 10
+    if "over 1.5 goles" in label:
+        if "over" in under_over:
+            score += 8
+    if "over 2.5 goles" in label:
+        if "over" in under_over:
+            score += 10
+
+    # Ambos anotan usando advice como ayuda ligera
+    if "ambos anotan" in label and "goals" in advice:
+        score += 4
+    if "ambos no anotan" in label and "under" in advice:
+        score += 4
+
+    # Tarjetas/corners: sin predicción directa, solo boost pequeño si el juego pinta competido
+    pct_home = percent_to_float(intel.get("percent_home"))
+    pct_away = percent_to_float(intel.get("percent_away"))
+    pct_draw = percent_to_float(intel.get("percent_draw"))
+
+    # Partido cerrado = más posibilidad de tarjetas
+    if "tarjetas" in label and pct_home is not None and pct_away is not None:
+        if abs(pct_home - pct_away) <= 12:
+            score += 5
+
+    # Partido abierto = más corners potenciales
+    if "corners" in label and "over" in under_over:
+        score += 5
+
+    return score
+
+def percent_to_float(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    s = str(v).replace("%", "").strip()
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+def base_pick_score(pick: Dict[str, Any]) -> float:
+    odds = float(pick["odds"])
+    market = pick.get("market", "")
+    score = 100.0
+
+    score -= abs(odds - 1.65) * 20
+
+    if market == "double_chance":
+        score += 10
+    elif market == "totals_goals":
+        score += 9
+    elif market == "btts":
+        score += 7
+    elif market == "cards":
+        score += 6
+    elif market == "corners":
+        score += 5
+    elif market == "h2h":
+        score += 4
+
+    if odds < 1.35:
+        score -= 8
+    if odds > 2.10:
+        score -= 10
+
+    return round(score, 2)
+
+# =========================================================
+# BUILD PICKS
 # =========================================================
 
 def build_goal_picks(merged_markets: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
@@ -434,33 +479,32 @@ def build_goal_picks(merged_markets: Dict[str, List[Dict[str, Any]]]) -> List[Di
         outcome = pick_best_outcome(totals, name=side, point=line)
         if not outcome:
             continue
-
         price = safe_float(outcome.get("price"))
         if price is None or not valid_pick_odds(price):
             continue
 
-        label = f"{side} {line:g} goles"
+        reason = "Línea de goles utilizable para previa."
         if side == "Under":
-            reason = "Partido con perfil más cerrado y línea manejable para goles."
-        else:
-            reason = "Línea accesible de goles para un partido con opción de movimiento ofensivo."
+            reason = "Partido con ruta razonable a pocos goles."
+        elif line == 1.5:
+            reason = "Línea accesible para que el juego tenga al menos dos goles."
+        elif line == 2.5:
+            reason = "Partido con opción real de superar la línea de goles."
 
         picks.append({
             "market": "totals_goals",
-            "label": label,
+            "label": f"{side} {line:g} goles",
             "odds": price,
             "reason_es": reason,
-            "bookmaker": outcome.get("_bookmaker", ""),
         })
-
     return picks
 
 def build_btts_picks(merged_markets: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
     picks = []
-    btts = merged_markets.get("btts", [])
+    outcomes = merged_markets.get("btts", [])
 
-    yes = pick_best_outcome(btts, name="Yes")
-    no = pick_best_outcome(btts, name="No")
+    yes = pick_best_outcome(outcomes, name="Yes")
+    no = pick_best_outcome(outcomes, name="No")
 
     if yes:
         price = safe_float(yes.get("price"))
@@ -469,8 +513,7 @@ def build_btts_picks(merged_markets: Dict[str, List[Dict[str, Any]]]) -> List[Di
                 "market": "btts",
                 "label": "Ambos anotan",
                 "odds": price,
-                "reason_es": "Ambos equipos tienen ruta razonable para encontrar al menos un gol.",
-                "bookmaker": yes.get("_bookmaker", ""),
+                "reason_es": "Ambos equipos tienen camino razonable al gol.",
             })
 
     if no:
@@ -480,22 +523,17 @@ def build_btts_picks(merged_markets: Dict[str, List[Dict[str, Any]]]) -> List[Di
                 "market": "btts",
                 "label": "Ambos NO anotan",
                 "odds": price,
-                "reason_es": "Uno de los dos puede quedarse corto en ataque o el partido puede trabarse.",
-                "bookmaker": no.get("_bookmaker", ""),
+                "reason_es": "Existe opción de que uno de los dos se quede sin marcar.",
             })
 
     return picks
 
-def build_h2h_picks(
-    merged_markets: Dict[str, List[Dict[str, Any]]],
-    home_team: str,
-    away_team: str
-) -> List[Dict[str, Any]]:
+def build_h2h_picks(merged_markets: Dict[str, List[Dict[str, Any]]], home: str, away: str) -> List[Dict[str, Any]]:
     picks = []
-    h2h = merged_markets.get("h2h", [])
+    outcomes = merged_markets.get("h2h", [])
 
-    for team in [home_team, away_team]:
-        outcome = pick_best_outcome(h2h, name=team)
+    for team in [home, away]:
+        outcome = pick_best_outcome(outcomes, name=team)
         if not outcome:
             continue
         price = safe_float(outcome.get("price"))
@@ -506,60 +544,45 @@ def build_h2h_picks(
             "market": "h2h",
             "label": f"{team} gana",
             "odds": price,
-            "reason_es": f"{team} aparece con una cuota utilizable y ligera ventaja de mercado.",
-            "bookmaker": outcome.get("_bookmaker", ""),
+            "reason_es": f"{team} sale con cuota utilizable como favorito ligero.",
         })
 
     return picks
 
-def build_double_chance_picks(
-    merged_markets: Dict[str, List[Dict[str, Any]]],
-    home_team: str,
-    away_team: str
-) -> List[Dict[str, Any]]:
+def build_double_chance_picks(merged_markets: Dict[str, List[Dict[str, Any]]], home: str, away: str) -> List[Dict[str, Any]]:
     picks = []
-    dc = merged_markets.get("double_chance", [])
+    outcomes = merged_markets.get("double_chance", [])
 
     targets = [
-        f"{home_team} or Draw",
-        f"{away_team} or Draw",
+        (f"{home} or Draw", f"{home} o empate", f"{home} tiene respaldo cubriendo también el empate."),
+        (f"{away} or Draw", f"{away} o empate", f"{away} tiene respaldo cubriendo también el empate."),
     ]
 
-    for target in targets:
-        outcome = pick_best_outcome(dc, name=target)
+    for raw_name, label, reason in targets:
+        outcome = pick_best_outcome(outcomes, name=raw_name)
         if not outcome:
             continue
-
         price = safe_float(outcome.get("price"))
         if price is None or not valid_pick_odds(price):
             continue
-
-        if target.startswith(home_team):
-            label = f"{home_team} o empate"
-            reason = f"{home_team} tiene respaldo extra al cubrir también el empate."
-        else:
-            label = f"{away_team} o empate"
-            reason = f"{away_team} tiene respaldo extra al cubrir también el empate."
 
         picks.append({
             "market": "double_chance",
             "label": label,
             "odds": price,
             "reason_es": reason,
-            "bookmaker": outcome.get("_bookmaker", ""),
         })
 
     return picks
 
 def build_corners_picks(merged_markets: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
     picks = []
-    corners = merged_markets.get("alternate_totals_corners", [])
+    outcomes = merged_markets.get("alternate_totals_corners", [])
 
     for side, line in PREFERRED_CORNERS_LINES:
-        outcome = pick_best_outcome(corners, name=side, point=line)
+        outcome = pick_best_outcome(outcomes, name=side, point=line)
         if not outcome:
             continue
-
         price = safe_float(outcome.get("price"))
         if price is None or not valid_pick_odds(price):
             continue
@@ -568,21 +591,19 @@ def build_corners_picks(merged_markets: Dict[str, List[Dict[str, Any]]]) -> List
             "market": "corners",
             "label": f"{side} {line:g} corners",
             "odds": price,
-            "reason_es": "Línea de corners utilizable para un partido con volumen ofensivo razonable.",
-            "bookmaker": outcome.get("_bookmaker", ""),
+            "reason_es": "Línea de corners interesante para previa.",
         })
 
     return picks
 
 def build_cards_picks(merged_markets: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
     picks = []
-    cards = merged_markets.get("alternate_totals_cards", [])
+    outcomes = merged_markets.get("alternate_totals_cards", [])
 
     for side, line in PREFERRED_CARDS_LINES:
-        outcome = pick_best_outcome(cards, name=side, point=line)
+        outcome = pick_best_outcome(outcomes, name=side, point=line)
         if not outcome:
             continue
-
         price = safe_float(outcome.get("price"))
         if price is None or not valid_pick_odds(price):
             continue
@@ -591,8 +612,7 @@ def build_cards_picks(merged_markets: Dict[str, List[Dict[str, Any]]]) -> List[D
             "market": "cards",
             "label": f"{side} {line:g} tarjetas",
             "odds": price,
-            "reason_es": "Línea de tarjetas atractiva para un juego con margen de fricción y faltas.",
-            "bookmaker": outcome.get("_bookmaker", ""),
+            "reason_es": "Línea de tarjetas atractiva para previa.",
         })
 
     return picks
@@ -600,78 +620,93 @@ def build_cards_picks(merged_markets: Dict[str, List[Dict[str, Any]]]) -> List[D
 def build_all_candidate_picks(
     game: Dict[str, Any],
     base_bookmakers: List[Dict[str, Any]],
-    event_bookmakers: List[Dict[str, Any]]
+    extra_bookmakers: List[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
-    merged_base = market_outcomes_by_key(base_bookmakers)
-    merged_event = market_outcomes_by_key(event_bookmakers)
-    merged_all = {}
-    merged_all.update(merged_base)
-    for k, v in merged_event.items():
-        merged_all.setdefault(k, [])
-        merged_all[k].extend(v)
+    merged = market_outcomes_by_key(base_bookmakers)
+    merged_extra = market_outcomes_by_key(extra_bookmakers)
+
+    for k, v in merged_extra.items():
+        merged.setdefault(k, [])
+        merged[k].extend(v)
 
     home = game.get("home_team", "")
     away = game.get("away_team", "")
 
     picks: List[Dict[str, Any]] = []
-    picks.extend(build_goal_picks(merged_all))
-    picks.extend(build_btts_picks(merged_all))
-    picks.extend(build_h2h_picks(merged_all, home, away))
-    picks.extend(build_double_chance_picks(merged_all, home, away))
-    picks.extend(build_corners_picks(merged_all))
-    picks.extend(build_cards_picks(merged_all))
+    picks.extend(build_goal_picks(merged))
+    picks.extend(build_btts_picks(merged))
+    picks.extend(build_h2h_picks(merged, home, away))
+    picks.extend(build_double_chance_picks(merged, home, away))
+    picks.extend(build_corners_picks(merged))
+    picks.extend(build_cards_picks(merged))
 
-    # Score y orden
-    for p in picks:
-        p["score"] = score_pick(p)
-
-    picks.sort(key=lambda x: x["score"], reverse=True)
     return picks
 
 # =========================================================
-# COMBO ENGINE
+# COMBOS
 # =========================================================
 
-def choose_best_combo(candidate_picks: List[Dict[str, Any]]) -> Optional[Tuple[List[Dict[str, Any]], float]]:
-    if len(candidate_picks) < MIN_LEGS:
-        return None
+def picks_conflict(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+    la = a["label"].lower()
+    lb = b["label"].lower()
 
+    if la == lb:
+        return True
+
+    if ("ambos anotan" in la and "ambos no anotan" in lb) or ("ambos anotan" in lb and "ambos no anotan" in la):
+        return True
+
+    if ("gana" in la and "o empate" in lb) or ("gana" in lb and "o empate" in la):
+        return True
+
+    if a.get("market") == b.get("market") and a.get("market") in {"cards", "corners", "double_chance"}:
+        return True
+
+    return False
+
+def combo_is_valid(picks: List[Dict[str, Any]]) -> bool:
+    for i in range(len(picks)):
+        for j in range(i + 1, len(picks)):
+            if picks_conflict(picks[i], picks[j]):
+                return False
+    return True
+
+def choose_best_combo(picks: List[Dict[str, Any]]) -> Optional[Tuple[List[Dict[str, Any]], float]]:
     best_combo = None
     best_score = -1e9
 
-    # 2 legs
-    for i in range(len(candidate_picks)):
-        for j in range(i + 1, len(candidate_picks)):
-            combo = [candidate_picks[i], candidate_picks[j]]
-            if not combo_is_coherent(combo):
+    # 2 picks
+    for i in range(len(picks)):
+        for j in range(i + 1, len(picks)):
+            combo = [picks[i], picks[j]]
+            if not combo_is_valid(combo):
                 continue
-
             total = combo_odds(combo)
             if not valid_combo_odds(total):
                 continue
-
-            score = sum(p["score"] for p in combo) + (10 if 2.10 <= total <= 3.80 else 0)
+            score = sum(p["score"] for p in combo)
+            if 2.10 <= total <= 3.80:
+                score += 10
             if score > best_score:
                 best_score = score
                 best_combo = (combo, total)
 
-    # 3 legs
-    if MAX_LEGS >= 3:
-        for i in range(len(candidate_picks)):
-            for j in range(i + 1, len(candidate_picks)):
-                for k in range(j + 1, len(candidate_picks)):
-                    combo = [candidate_picks[i], candidate_picks[j], candidate_picks[k]]
-                    if not combo_is_coherent(combo):
-                        continue
-
-                    total = combo_odds(combo)
-                    if not valid_combo_odds(total):
-                        continue
-
-                    score = sum(p["score"] for p in combo) + (14 if 2.30 <= total <= 4.20 else 0)
-                    if score > best_score:
-                        best_score = score
-                        best_combo = (combo, total)
+    # 3 picks
+    for i in range(len(picks)):
+        for j in range(i + 1, len(picks)):
+            for k in range(j + 1, len(picks)):
+                combo = [picks[i], picks[j], picks[k]]
+                if not combo_is_valid(combo):
+                    continue
+                total = combo_odds(combo)
+                if not valid_combo_odds(total):
+                    continue
+                score = sum(p["score"] for p in combo)
+                if 2.30 <= total <= 4.20:
+                    score += 14
+                if score > best_score:
+                    best_score = score
+                    best_combo = (combo, total)
 
     return best_combo
 
@@ -679,131 +714,168 @@ def choose_best_combo(candidate_picks: List[Dict[str, Any]]) -> Optional[Tuple[L
 # TELEGRAM
 # =========================================================
 
+def format_signal(game: Dict[str, Any], picks: List[Dict[str, Any]], total_price: float, intel: Dict[str, Any]) -> str:
+    lines = []
+    lines.append("📊 SEÑAL PREPARTIDO PRO")
+    lines.append("")
+    lines.append(f"🏟 Partido: {fixture_name(game)}")
+    lines.append(f"🏆 Liga: {game.get('sport_title', game.get('sport_key', ''))}")
+    lines.append(f"🕒 Hora: {format_local_time(game['commence_time'])}")
+    lines.append("")
+
+    if intel.get("advice"):
+        lines.append(f"🧠 Lectura API-Football: {intel['advice']}")
+        lines.append("")
+
+    lines.append("✅ Picks:")
+    for p in picks:
+        lines.append(f"- {p['label']} @ {p['odds']:.2f}")
+
+    lines.append("")
+    lines.append(f"🎯 Cuota combinada: {total_price:.2f}")
+    lines.append("")
+    lines.append("📝 Motivos:")
+    for p in picks:
+        lines.append(f"• {p['reason_es']}")
+    lines.append("")
+    lines.append("💰 Stake sugerido: 0.5u a 1u")
+
+    return "\n".join(lines)
+
 async def send_text(text: str) -> bool:
     try:
         await bot.send_message(chat_id=CHAT_ID, text=text)
         return True
     except TelegramError as e:
-        logger.error("TelegramError al enviar mensaje: %s", e)
+        logger.error("TelegramError: %s", e)
         return False
     except Exception as e:
-        logger.exception("Error inesperado enviando mensaje: %s", e)
+        logger.exception("Error inesperado enviando Telegram: %s", e)
         return False
 
 # =========================================================
-# MAIN PREMATCH FLOW
+# FLUJO PRINCIPAL
 # =========================================================
 
 async def collect_upcoming_games(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
-    all_games: List[Dict[str, Any]] = []
+    all_games = []
 
     for league in LEAGUES:
-        games, headers = await get_upcoming_odds_for_league(client, league)
-        remaining = read_remaining_credits(headers)
-        if remaining is not None:
-            logger.info("Créditos/header (%s): %s", league, remaining)
-
+        games = await get_upcoming_odds_for_league(client, league)
         for game in games:
             if is_within_window(game.get("commence_time", ""), PREMATCH_WINDOW_HOURS):
                 all_games.append(game)
 
-    # Orden por hora de inicio
     all_games.sort(key=lambda g: g.get("commence_time", "9999"))
     return all_games
 
-async def build_prematch_signal_for_game(
+async def enrich_with_api_football_intel(
     client: httpx.AsyncClient,
     game: Dict[str, Any]
-) -> Optional[Tuple[List[Dict[str, Any]], float]]:
+) -> Dict[str, Any]:
+    sport_key = game.get("sport_key")
+    mapping = API_FOOTBALL_LEAGUE_MAP.get(sport_key)
+    if not mapping:
+        return {}
+
+    fixture_id = await find_fixture_id_api_football(
+        client=client,
+        league_id=mapping["league_id"],
+        season=mapping["season"],
+        home_team=game.get("home_team", ""),
+        away_team=game.get("away_team", ""),
+        event_dt=game.get("commence_time", ""),
+    )
+    if not fixture_id:
+        return {}
+
+    pred = await get_prediction_api_football(client, fixture_id)
+    return extract_prediction_signals(pred)
+
+async def build_signal_for_game(
+    client: httpx.AsyncClient,
+    game: Dict[str, Any]
+) -> Optional[Tuple[List[Dict[str, Any]], float, Dict[str, Any]]]:
     sport_key = game.get("sport_key")
     event_id = game.get("id")
-
     if not sport_key or not event_id:
         return None
 
-    event_data, headers = await get_event_extra_markets(client, sport_key, event_id)
-    remaining = read_remaining_credits(headers)
-    if remaining is not None:
-        logger.info("Créditos/header (evento %s): %s", event_id[:8], remaining)
-
-    event_bookmakers = []
-    if event_data and isinstance(event_data, dict):
-        event_bookmakers = event_data.get("bookmakers", []) or []
-
+    event_data = await get_event_extra_markets(client, sport_key, event_id)
+    extra_bookmakers = event_data.get("bookmakers", []) if isinstance(event_data, dict) else []
     base_bookmakers = game.get("bookmakers", []) or []
 
-    candidate_picks = build_all_candidate_picks(game, base_bookmakers, event_bookmakers)
+    candidate_picks = build_all_candidate_picks(game, base_bookmakers, extra_bookmakers)
     if len(candidate_picks) < 2:
-        logger.info("Sin picks suficientes para %s", fixture_name(game))
         return None
 
+    intel = await enrich_with_api_football_intel(client, game)
+
+    # score final: odds + intelligence
+    home = game.get("home_team", "")
+    away = game.get("away_team", "")
+
+    for p in candidate_picks:
+        p["score"] = base_pick_score(p) + prediction_boost_for_pick(p, intel, home, away)
+
+    candidate_picks.sort(key=lambda x: x["score"], reverse=True)
+
     combo = choose_best_combo(candidate_picks)
-    return combo
+    if not combo:
+        return None
 
-async def run_prematch_cycle() -> None:
-    global credits_alert_sent
+    picks, total = combo
+    return picks, total, intel
 
-    logger.info("Iniciando ciclo prepartido...")
-    messages_sent = 0
+async def run_cycle() -> None:
+    logger.info("Iniciando ciclo V13 PRO...")
+    sent_count = 0
 
     async with httpx.AsyncClient() as client:
-        upcoming_games = await collect_upcoming_games(client)
-
-        if not upcoming_games:
-            logger.info("No hay partidos próximos en ventana.")
+        games = await collect_upcoming_games(client)
+        if not games:
+            logger.info("No hay partidos en ventana.")
             return
 
-        # Solo profundiza algunos por ciclo para cuidar créditos
-        games_to_scan = upcoming_games[:MAX_EVENTS_TO_DEEP_SCAN_PER_CYCLE]
-        logger.info("Partidos a revisar a detalle: %s", len(games_to_scan))
+        games = games[:MAX_EVENTS_TO_DEEP_SCAN_PER_CYCLE]
 
-        for game in games_to_scan:
-            if messages_sent >= MAX_MESSAGES_PER_CYCLE:
+        for game in games:
+            if sent_count >= MAX_MESSAGES_PER_CYCLE:
                 logger.info("Límite de mensajes por ciclo alcanzado.")
                 break
 
             try:
-                combo_result = await build_prematch_signal_for_game(client, game)
-                if not combo_result:
+                result = await build_signal_for_game(client, game)
+                if not result:
                     continue
 
-                picks, total_price = combo_result
-                key = signal_dedupe_key(game, picks)
-
+                picks, total, intel = result
+                key = dedupe_key(game, picks)
                 if key in sent_signal_keys:
                     logger.info("Señal duplicada omitida: %s", key)
                     continue
 
-                sent_signal_keys.add(key)
-                msg = format_signal_message(game, picks, total_price)
+                msg = format_signal(game, picks, total, intel)
                 ok = await send_text(msg)
-
                 if ok:
-                    messages_sent += 1
-                    logger.info("Señal enviada para %s", fixture_name(game))
+                    sent_signal_keys.add(key)
+                    sent_count += 1
+                    logger.info("Señal enviada: %s", fixture_name(game))
 
             except Exception as e:
-                logger.exception("Error procesando juego %s: %s", fixture_name(game), e)
-
-# =========================================================
-# LOOP
-# =========================================================
+                logger.exception("Error procesando %s: %s", fixture_name(game), e)
 
 async def main() -> None:
-    logger.info("Bot V12 PRO PREMATCH iniciado.")
-    logger.info("Live signals habilitadas: %s", ENABLE_LIVE_SIGNALS)
+    logger.info("Bot V13 PRO INTELIGENTE iniciado")
+    logger.info("Live habilitado: %s", ENABLE_LIVE_SIGNALS)
 
     while True:
         try:
-            await run_prematch_cycle()
+            await run_cycle()
         except Exception as e:
-            logger.exception("Error en ciclo principal: %s", e)
+            logger.exception("Error en loop principal: %s", e)
 
         await asyncio.sleep(SCAN_INTERVAL_SECONDS)
-
-# =========================================================
-# START
-# =========================================================
 
 if __name__ == "__main__":
     asyncio.run(main())
