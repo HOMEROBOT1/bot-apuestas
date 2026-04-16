@@ -1,12 +1,14 @@
 """
-V13 PRO INTELIGENTE - Telegram Betting Bot
-------------------------------------------
+V13.2 PRO INTELIGENTE - Telegram Betting Bot
+--------------------------------------------
 Usa:
 - The Odds API -> cuotas y mercados reales
 - API-Football -> inteligencia previa (predictions)
 
 Objetivo:
 - Prioridad total a señales PREPARTIDO
+- Trabajar solo de 7:00 AM a 10:00 PM
+- Si no hay partidos hoy, dormir hasta el día siguiente
 - Construir picks más lógicos antes de usar cuotas
 - Combinar 2 o 3 selecciones
 - Evitar duplicados
@@ -15,7 +17,7 @@ Objetivo:
 import asyncio
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
@@ -23,9 +25,6 @@ import httpx
 from telegram import Bot
 from telegram.error import TelegramError
 
-import os
-
-print("DEBUG ENV:", os.environ)
 # =========================================================
 # LOGGING
 # =========================================================
@@ -34,7 +33,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
-logger = logging.getLogger("v13_pro")
+logger = logging.getLogger("v13_2_pro")
 
 # =========================================================
 # VARIABLES DE ENTORNO
@@ -73,20 +72,30 @@ API_FOOTBALL_LEAGUE_MAP = {
     "soccer_uefa_champs_league": {"league_id": 2, "season": 2025},
 }
 
-SCAN_INTERVAL_SECONDS = 900
+# Horario laboral del bot
+WORK_START_HOUR = 7
+WORK_END_HOUR = 22   # 10 PM
+SEND_NO_FIXTURES_MESSAGE = True
+
+# Frecuencia de revisión dentro del horario laboral
+SCAN_INTERVAL_SECONDS = 900  # 15 min
+
+# Ventana prepartido
 PREMATCH_WINDOW_HOURS = 18
+
+# Límites
 MAX_EVENTS_TO_DEEP_SCAN_PER_CYCLE = 8
 MAX_MESSAGES_PER_CYCLE = 3
 
 ODDS_REGION = "uk"
-
+BASE_MARKETS = "h2h,totals"
 EVENT_MARKETS = "double_chance,alternate_totals_corners,alternate_totals_cards"
 
 MIN_PICK_ODDS = 1.30
 MAX_PICK_ODDS = 2.20
 MIN_COMBO_ODDS = 2.00
 MAX_COMBO_ODDS = 4.50
-BASE_MARKETS = "h2h,totals"
+
 PREFERRED_GOAL_LINES = [
     ("Under", 3.5),
     ("Over", 1.5),
@@ -113,6 +122,7 @@ ENABLE_LIVE_SIGNALS = False
 
 bot = Bot(token=BOT_TOKEN)
 sent_signal_keys = set()
+last_no_fixtures_alert_date = None
 
 # =========================================================
 # HELPERS
@@ -120,6 +130,9 @@ sent_signal_keys = set()
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
+def now_local() -> datetime:
+    return datetime.now(TZ)
 
 def parse_dt(dt_str: str) -> datetime:
     return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
@@ -131,6 +144,38 @@ def format_local_time(dt_str: str) -> str:
 def is_within_window(commence_time: str, hours: int) -> bool:
     diff = (parse_dt(commence_time) - now_utc()).total_seconds()
     return 0 < diff <= hours * 3600
+
+def is_within_working_hours() -> bool:
+    current = now_local()
+    return WORK_START_HOUR <= current.hour < WORK_END_HOUR
+
+def seconds_until_next_start() -> int:
+    current = now_local()
+    next_start = current.replace(
+        hour=WORK_START_HOUR,
+        minute=0,
+        second=0,
+        microsecond=0
+    )
+
+    if current.hour >= WORK_END_HOUR:
+        next_start = next_start + timedelta(days=1)
+    elif current.hour < WORK_START_HOUR:
+        pass
+    else:
+        return 0
+
+    return max(60, int((next_start - current).total_seconds()))
+
+def seconds_until_tomorrow_start() -> int:
+    current = now_local()
+    next_start = current.replace(
+        hour=WORK_START_HOUR,
+        minute=0,
+        second=0,
+        microsecond=0
+    ) + timedelta(days=1)
+    return max(60, int((next_start - current).total_seconds()))
 
 def valid_pick_odds(price: float) -> bool:
     return MIN_PICK_ODDS <= price <= MAX_PICK_ODDS
@@ -276,9 +321,6 @@ async def find_fixture_id_api_football(
     away_team: str,
     event_dt: str
 ) -> Optional[int]:
-    """
-    Busca fixture cercano por liga/temporada/fecha aproximada.
-    """
     date_str = parse_dt(event_dt).astimezone(TZ).strftime("%Y-%m-%d")
     url = f"{API_FOOTBALL_BASE}/fixtures"
     params = {
@@ -306,7 +348,6 @@ async def find_fixture_id_api_football(
         if home == home_lower and away == away_lower:
             return item.get("fixture", {}).get("id")
 
-    # fallback flexible
     for item in response:
         teams = item.get("teams", {})
         home = teams.get("home", {}).get("name", "").lower().strip()
@@ -339,10 +380,16 @@ async def get_prediction_api_football(
 # INTELIGENCIA API-FOOTBALL
 # =========================================================
 
+def percent_to_float(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    s = str(v).replace("%", "").strip()
+    try:
+        return float(s)
+    except Exception:
+        return None
+
 def extract_prediction_signals(pred: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Saca señales útiles del endpoint predictions.
-    """
     result = {
         "winner_name": None,
         "winner_comment": None,
@@ -376,9 +423,6 @@ def extract_prediction_signals(pred: Optional[Dict[str, Any]]) -> Dict[str, Any]
     return result
 
 def prediction_boost_for_pick(pick: Dict[str, Any], intel: Dict[str, Any], home_team: str, away_team: str) -> float:
-    """
-    Sube o baja score del pick según la predicción.
-    """
     score = 0.0
     label = pick["label"].lower()
 
@@ -389,7 +433,6 @@ def prediction_boost_for_pick(pick: Dict[str, Any], intel: Dict[str, Any], home_
     home_lower = home_team.lower()
     away_lower = away_team.lower()
 
-    # Ganador / doble oportunidad
     if home_lower in label and winner_name == home_lower:
         score += 12
     if away_lower in label and winner_name == away_lower:
@@ -401,47 +444,29 @@ def prediction_boost_for_pick(pick: Dict[str, Any], intel: Dict[str, Any], home_
         if away_lower in label and winner_name == away_lower:
             score += 10
 
-    # Under/over goles
-    if "under 3.5 goles" in label:
-        if "under" in under_over:
-            score += 10
-    if "over 1.5 goles" in label:
-        if "over" in under_over:
-            score += 8
-    if "over 2.5 goles" in label:
-        if "over" in under_over:
-            score += 10
+    if "under 3.5 goles" in label and "under" in under_over:
+        score += 10
+    if "over 1.5 goles" in label and "over" in under_over:
+        score += 8
+    if "over 2.5 goles" in label and "over" in under_over:
+        score += 10
 
-    # Ambos anotan usando advice como ayuda ligera
     if "ambos anotan" in label and "goals" in advice:
         score += 4
     if "ambos no anotan" in label and "under" in advice:
         score += 4
 
-    # Tarjetas/corners: sin predicción directa, solo boost pequeño si el juego pinta competido
     pct_home = percent_to_float(intel.get("percent_home"))
     pct_away = percent_to_float(intel.get("percent_away"))
-    pct_draw = percent_to_float(intel.get("percent_draw"))
 
-    # Partido cerrado = más posibilidad de tarjetas
     if "tarjetas" in label and pct_home is not None and pct_away is not None:
         if abs(pct_home - pct_away) <= 12:
             score += 5
 
-    # Partido abierto = más corners potenciales
     if "corners" in label and "over" in under_over:
         score += 5
 
     return score
-
-def percent_to_float(v: Any) -> Optional[float]:
-    if v is None:
-        return None
-    s = str(v).replace("%", "").strip()
-    try:
-        return float(s)
-    except Exception:
-        return None
 
 def base_pick_score(pick: Dict[str, Any]) -> float:
     odds = float(pick["odds"])
@@ -502,34 +527,9 @@ def build_goal_picks(merged_markets: Dict[str, List[Dict[str, Any]]]) -> List[Di
         })
     return picks
 
-def build_btts_picks(merged_markets: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
-    picks = []
-    outcomes = merged_markets.get("btts", [])
-
-    yes = pick_best_outcome(outcomes, name="Yes")
-    no = pick_best_outcome(outcomes, name="No")
-
-    if yes:
-        price = safe_float(yes.get("price"))
-        if price is not None and valid_pick_odds(price):
-            picks.append({
-                "market": "btts",
-                "label": "Ambos anotan",
-                "odds": price,
-                "reason_es": "Ambos equipos tienen camino razonable al gol.",
-            })
-
-    if no:
-        price = safe_float(no.get("price"))
-        if price is not None and valid_pick_odds(price):
-            picks.append({
-                "market": "btts",
-                "label": "Ambos NO anotan",
-                "odds": price,
-                "reason_es": "Existe opción de que uno de los dos se quede sin marcar.",
-            })
-
-    return picks
+def build_btts_picks(_: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    # BTTS se dejó fuera del endpoint base para evitar INVALID_MARKET
+    return []
 
 def build_h2h_picks(merged_markets: Dict[str, List[Dict[str, Any]]], home: str, away: str) -> List[Dict[str, Any]]:
     picks = []
@@ -678,7 +678,6 @@ def choose_best_combo(picks: List[Dict[str, Any]]) -> Optional[Tuple[List[Dict[s
     best_combo = None
     best_score = -1e9
 
-    # 2 picks
     for i in range(len(picks)):
         for j in range(i + 1, len(picks)):
             combo = [picks[i], picks[j]]
@@ -694,7 +693,6 @@ def choose_best_combo(picks: List[Dict[str, Any]]) -> Optional[Tuple[List[Dict[s
                 best_score = score
                 best_combo = (combo, total)
 
-    # 3 picks
     for i in range(len(picks)):
         for j in range(i + 1, len(picks)):
             for k in range(j + 1, len(picks)):
@@ -814,7 +812,6 @@ async def build_signal_for_game(
 
     intel = await enrich_with_api_football_intel(client, game)
 
-    # score final: odds + intelligence
     home = game.get("home_team", "")
     away = game.get("away_team", "")
 
@@ -830,15 +827,43 @@ async def build_signal_for_game(
     picks, total = combo
     return picks, total, intel
 
-async def run_cycle() -> None:
-    logger.info("Iniciando ciclo V13 PRO...")
+async def run_cycle() -> bool:
+    """
+    Devuelve True si debe dormir hasta mañana.
+    Devuelve False si debe seguir en ciclos normales.
+    """
+    global last_no_fixtures_alert_date
+
+    logger.info("Iniciando ciclo V13.2 PRO...")
     sent_count = 0
+
+    if not is_within_working_hours():
+        sleep_seconds = seconds_until_next_start()
+        logger.info(
+            "Fuera de horario de trabajo. Durmiendo %s segundos hasta las %02d:00.",
+            sleep_seconds,
+            WORK_START_HOUR
+        )
+        await asyncio.sleep(sleep_seconds)
+        return False
 
     async with httpx.AsyncClient() as client:
         games = await collect_upcoming_games(client)
+
         if not games:
-            logger.info("No hay partidos en ventana.")
-            return
+            today_str = now_local().strftime("%Y-%m-%d")
+
+            if SEND_NO_FIXTURES_MESSAGE and last_no_fixtures_alert_date != today_str:
+                msg = (
+                    "📅 Hoy no encontré partidos en tus ligas configuradas "
+                    "(Liga MX, Premier y Champions) dentro de la ventana de revisión.\n\n"
+                    f"😴 El bot se dormirá y volverá a revisar mañana a las {WORK_START_HOUR}:00."
+                )
+                await send_text(msg)
+                last_no_fixtures_alert_date = today_str
+
+            logger.info("No hay partidos en ventana. El bot dormirá hasta mañana.")
+            return True
 
         games = games[:MAX_EVENTS_TO_DEEP_SCAN_PER_CYCLE]
 
@@ -868,17 +893,33 @@ async def run_cycle() -> None:
             except Exception as e:
                 logger.exception("Error procesando %s: %s", fixture_name(game), e)
 
+    return False
+
 async def main() -> None:
-    logger.info("Bot V13 PRO INTELIGENTE iniciado")
+    logger.info("Bot V13.2 PRO INTELIGENTE iniciado")
     logger.info("Live habilitado: %s", ENABLE_LIVE_SIGNALS)
+    logger.info("Horario de trabajo: %02d:00 a %02d:00", WORK_START_HOUR, WORK_END_HOUR)
 
     while True:
         try:
-            await run_cycle()
+            should_sleep_until_tomorrow = await run_cycle()
+
+            if should_sleep_until_tomorrow:
+                sleep_seconds = seconds_until_tomorrow_start()
+                logger.info(
+                    "Durmiendo hasta mañana a las %02d:00. Segundos: %s",
+                    WORK_START_HOUR,
+                    sleep_seconds
+                )
+                await asyncio.sleep(sleep_seconds)
+                continue
+
         except Exception as e:
             logger.exception("Error en loop principal: %s", e)
+            await asyncio.sleep(60)
 
-        await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+        if is_within_working_hours():
+            await asyncio.sleep(SCAN_INTERVAL_SECONDS)
 
 if __name__ == "__main__":
     asyncio.run(main())
