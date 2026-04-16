@@ -79,14 +79,14 @@ MAX_EVENTS_TO_DEEP_SCAN_PER_CYCLE = 8
 MAX_MESSAGES_PER_CYCLE = 3
 
 ODDS_REGION = "uk"
-BASE_MARKETS = "h2h,totals,btts"
+
 EVENT_MARKETS = "double_chance,alternate_totals_corners,alternate_totals_cards"
 
 MIN_PICK_ODDS = 1.30
 MAX_PICK_ODDS = 2.20
 MIN_COMBO_ODDS = 2.00
 MAX_COMBO_ODDS = 4.50
-
+BASE_MARKETS = "h2h,totals"
 PREFERRED_GOAL_LINES = [
     ("Under", 3.5),
     ("Over", 1.5),
