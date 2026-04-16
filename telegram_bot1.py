@@ -40,10 +40,10 @@ logger = logging.getLogger("v13_pro")
 # VARIABLES DE ENTORNO
 # =========================================================
 
-BOT_TOKEN = os.getenv("8713741185:AAFqvoZ0Ji3xWw2FsA8BuMslfCGhQ0tMzCQ", "").strip()
-CHAT_ID = os.getenv("1983622390", "").strip()
-ODDS_API_KEY = os.getenv("92f3a8c48fe9834c7b1e6bbf38346064", "").strip()
-API_FOOTBALL_KEY = os.getenv("c455630d0023ef208f93dd0567164905", "").strip()
+BOT_TOKEN = "8713741185:AAFqvoZ0Ji3xWw2FsA8BuMslfCGhQ0tMzCQ"
+CHAT_ID = "1983622390"
+ODDS_API_KEY = "92f3a8c48fe9834c7b1e6bbf38346064"
+API_FOOTBALL_KEY = "c455630d0023ef208f93dd0567164905"
 
 if not BOT_TOKEN:
     raise ValueError("Falta BOT_TOKEN")
