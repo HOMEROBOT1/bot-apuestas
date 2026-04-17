@@ -1,948 +1,778 @@
-"""
-V13.2 PRO INTELIGENTE - Telegram Betting Bot
---------------------------------------------
-Usa:
-- The Odds API -> cuotas y mercados reales
-- API-Football -> inteligencia previa (predictions)
-
-Objetivo:
-- Prioridad total a señales PREPARTIDO
-- Trabajar solo de 7:00 AM a 10:00 PM
-- Si no hay partidos hoy, dormir hasta el día siguiente
-- Construir picks más lógicos antes de usar cuotas
-- Combinar 2 o 3 selecciones
-- Evitar duplicados
-"""
-
 import asyncio
 import logging
 import os
-from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+import re
+from datetime import datetime, timedelta, timezone
+from statistics import mean
 from zoneinfo import ZoneInfo
 
 import httpx
 from telegram import Bot
 from telegram.error import TelegramError
 
-# =========================================================
+# =============================================================================
 # LOGGING
-# =========================================================
+# =============================================================================
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
-logger = logging.getLogger("v13_2_pro")
 
-# =========================================================
-# VARIABLES DE ENTORNO
-# =========================================================
+# =============================================================================
+# CONFIG DESDE VARIABLES DE ENTORNO
+# =============================================================================
 
 BOT_TOKEN = "8713741185:AAFqvoZ0Ji3xWw2FsA8BuMslfCGhQ0tMzCQ"
 CHAT_ID = "1983622390"
 ODDS_API_KEY = "92f3a8c48fe9834c7b1e6bbf38346064"
 API_FOOTBALL_KEY = "c455630d0023ef208f93dd0567164905"
 
-if not BOT_TOKEN:
-    raise ValueError("Falta BOT_TOKEN")
-if not CHAT_ID:
-    raise ValueError("Falta CHAT_ID")
-if not ODDS_API_KEY:
-    raise ValueError("Falta ODDS_API_KEY")
-if not API_FOOTBALL_KEY:
-    raise ValueError("Falta API_FOOTBALL_KEY")
+DB_PATH = os.getenv("DB_PATH", "bot_state.txt").strip()
 
-# =========================================================
-# CONFIG
-# =========================================================
+CYCLE_INTERVAL = int(os.getenv("CYCLE_INTERVAL", "900"))  # 15 min
+LOCAL_TZ = ZoneInfo(os.getenv("LOCAL_TZ", "America/Mexico_City"))
 
-TZ = ZoneInfo("America/Mexico_City")
+ODDS_REGIONS = os.getenv("ODDS_REGIONS", "uk").strip()
+ODDS_MARKETS = os.getenv("ODDS_MARKETS", "h2h").strip()
+ODDS_BOOKMAKERS = os.getenv("ODDS_BOOKMAKERS", "").strip()
 
-LEAGUES = [
+MIN_VALUE_EDGE = float(os.getenv("MIN_VALUE_EDGE", "0.06"))
+PRE_MATCH_WINDOW_HOURS = int(os.getenv("PRE_MATCH_WINDOW_HOURS", "24"))
+
+ACTIVE_START_HOUR = int(os.getenv("ACTIVE_START_HOUR", "7"))
+ACTIVE_END_HOUR = int(os.getenv("ACTIVE_END_HOUR", "22"))
+
+ENABLE_PREMATCH = os.getenv("ENABLE_PREMATCH", "true").strip().lower() == "true"
+ENABLE_LIVE = os.getenv("ENABLE_LIVE", "true").strip().lower() == "true"
+ENABLE_PARLAY = os.getenv("ENABLE_PARLAY", "true").strip().lower() == "true"
+
+LIVE_MINUTE_THRESHOLD = int(os.getenv("LIVE_MINUTE_THRESHOLD", "60"))
+LIVE_DRAW_ONLY_MINUTE = int(os.getenv("LIVE_DRAW_ONLY_MINUTE", "70"))
+
+# =============================================================================
+# VALIDACIONES
+# =============================================================================
+
+required_vars = {
+    "BOT_TOKEN": BOT_TOKEN,
+    "CHAT_ID": CHAT_ID,
+    "ODDS_API_KEY": ODDS_API_KEY,
+    "API_FOOTBALL_KEY": API_FOOTBALL_KEY,
+}
+
+missing = [k for k, v in required_vars.items() if not v]
+if missing:
+    raise RuntimeError(f"Faltan variables de entorno: {', '.join(missing)}")
+
+bot = Bot(token=BOT_TOKEN)
+
+# =============================================================================
+# ESTADO EN MEMORIA
+# =============================================================================
+
+sent_live_signals = set()
+sent_prematch_signals = set()
+sent_parley_signals = set()
+sent_upcoming_match_alerts = set()
+
+odds_credits_alert_sent = False
+last_fixtures_found_alert_date = None
+last_no_fixtures_alert_date = None
+
+# =============================================================================
+# LIGAS PERMITIDAS
+# =============================================================================
+
+ODDS_SPORT_KEYS = [
     "soccer_mexico_ligamx",
     "soccer_epl",
     "soccer_uefa_champs_league",
 ]
 
-# Mapeo a API-Football
-API_FOOTBALL_LEAGUE_MAP = {
-    "soccer_mexico_ligamx": {"league_id": 262, "season": 2025},
-    "soccer_epl": {"league_id": 39, "season": 2025},
-    "soccer_uefa_champs_league": {"league_id": 2, "season": 2025},
+API_FOOTBALL_LEAGUES = {
+    262: "Liga MX",
+    39: "Premier League",
+    2: "Champions League",
 }
 
-# Horario laboral del bot
-WORK_START_HOUR = 7
-WORK_END_HOUR = 22   # 10 PM
-SEND_NO_FIXTURES_MESSAGE = True
+# =============================================================================
+# UTILIDADES
+# =============================================================================
 
-# Frecuencia de revisión dentro del horario laboral
-SCAN_INTERVAL_SECONDS = 900  # 15 min
+def now_local():
+    return datetime.now(LOCAL_TZ)
 
-# Ventana prepartido
-PREMATCH_WINDOW_HOURS = 18
-
-# Límites
-MAX_EVENTS_TO_DEEP_SCAN_PER_CYCLE = 8
-MAX_MESSAGES_PER_CYCLE = 3
-
-ODDS_REGION = "uk"
-BASE_MARKETS = "h2h,totals"
-EVENT_MARKETS = "double_chance,alternate_totals_corners,alternate_totals_cards"
-
-MIN_PICK_ODDS = 1.30
-MAX_PICK_ODDS = 2.20
-MIN_COMBO_ODDS = 2.00
-MAX_COMBO_ODDS = 4.50
-
-PREFERRED_GOAL_LINES = [
-    ("Under", 3.5),
-    ("Over", 1.5),
-    ("Over", 2.5),
-]
-
-PREFERRED_CORNERS_LINES = [
-    ("Over", 7.5),
-    ("Over", 8.5),
-    ("Over", 9.5),
-]
-
-PREFERRED_CARDS_LINES = [
-    ("Over", 3.5),
-    ("Over", 4.5),
-    ("Over", 5.5),
-]
-
-ENABLE_LIVE_SIGNALS = False
-
-# =========================================================
-# STATE
-# =========================================================
-
-bot = Bot(token=BOT_TOKEN)
-sent_signal_keys = set()
-last_no_fixtures_alert_date = None
-
-# =========================================================
-# HELPERS
-# =========================================================
-
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
-def now_local() -> datetime:
-    return datetime.now(TZ)
-
-def parse_dt(dt_str: str) -> datetime:
-    return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
-
-def format_local_time(dt_str: str) -> str:
-    dt = parse_dt(dt_str).astimezone(TZ)
-    return dt.strftime("%d/%m %I:%M %p")
-
-def is_within_window(commence_time: str, hours: int) -> bool:
-    diff = (parse_dt(commence_time) - now_utc()).total_seconds()
-    return 0 < diff <= hours * 3600
-
-def is_within_working_hours() -> bool:
-    current = now_local()
-    return WORK_START_HOUR <= current.hour < WORK_END_HOUR
-
-def seconds_until_next_start() -> int:
-    current = now_local()
-    next_start = current.replace(
-        hour=WORK_START_HOUR,
-        minute=0,
-        second=0,
-        microsecond=0
-    )
-
-    if current.hour >= WORK_END_HOUR:
-        next_start = next_start + timedelta(days=1)
-    elif current.hour < WORK_START_HOUR:
-        pass
-    else:
-        return 0
-
-    return max(60, int((next_start - current).total_seconds()))
-
-def seconds_until_tomorrow_start() -> int:
-    current = now_local()
-    next_start = current.replace(
-        hour=WORK_START_HOUR,
-        minute=0,
-        second=0,
-        microsecond=0
-    ) + timedelta(days=1)
-    return max(60, int((next_start - current).total_seconds()))
-
-def valid_pick_odds(price: float) -> bool:
-    return MIN_PICK_ODDS <= price <= MAX_PICK_ODDS
-
-def combo_odds(picks: List[Dict[str, Any]]) -> float:
-    total = 1.0
-    for p in picks:
-        total *= float(p["odds"])
-    return round(total, 2)
-
-def valid_combo_odds(price: float) -> bool:
-    return MIN_COMBO_ODDS <= price <= MAX_COMBO_ODDS
-
-def safe_float(value: Any) -> Optional[float]:
+def to_local(dt_str: str):
+    """
+    Convierte ISO UTC a hora local.
+    """
+    if not dt_str:
+        return None
     try:
-        return float(value)
+        dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+        return dt.astimezone(LOCAL_TZ)
     except Exception:
         return None
 
-def fixture_name(game: Dict[str, Any]) -> str:
-    return f"{game.get('home_team', 'Local')} vs {game.get('away_team', 'Visitante')}"
+def parse_minute(text):
+    if text is None:
+        return None
+    txt = str(text).strip()
+    m = re.search(r"(\d+)", txt)
+    if m:
+        return int(m.group(1))
+    return None
 
-def dedupe_key(game: Dict[str, Any], picks: List[Dict[str, Any]]) -> str:
-    labels = "|".join(sorted([p["label"] for p in picks]))
-    return f"{game.get('id', 'noid')}::{labels}"
+def normalize_team(name: str) -> str:
+    return re.sub(r"\s+", " ", (name or "").strip().lower())
 
-def market_outcomes_by_key(bookmakers: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-    merged: Dict[str, List[Dict[str, Any]]] = {}
-    for book in bookmakers or []:
-        for market in book.get("markets", []):
-            key = market.get("key")
-            if not key:
+def fixture_key(home: str, away: str, kickoff_local: datetime | None):
+    base = f"{normalize_team(home)}|{normalize_team(away)}"
+    if kickoff_local:
+        base += "|" + kickoff_local.strftime("%Y-%m-%d %H:%M")
+    return base
+
+def save_state():
+    try:
+        with open(DB_PATH, "w", encoding="utf-8") as f:
+            for item in sent_live_signals:
+                f.write(f"LIVE::{item}\n")
+            for item in sent_prematch_signals:
+                f.write(f"PRE::{item}\n")
+            for item in sent_parley_signals:
+                f.write(f"PAR::{item}\n")
+    except Exception as e:
+        logging.warning(f"No se pudo guardar estado: {e}")
+
+def load_state():
+    if not os.path.exists(DB_PATH):
+        return
+    try:
+        with open(DB_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("LIVE::"):
+                    sent_live_signals.add(line.replace("LIVE::", "", 1))
+                elif line.startswith("PRE::"):
+                    sent_prematch_signals.add(line.replace("PRE::", "", 1))
+                elif line.startswith("PAR::"):
+                    sent_parley_signals.add(line.replace("PAR::", "", 1))
+    except Exception as e:
+        logging.warning(f"No se pudo cargar estado: {e}")
+
+def implied_prob_from_decimal(odds: float):
+    if not odds or odds <= 1:
+        return None
+    return 1 / odds
+
+def decimal_from_prob(prob: float):
+    if not prob or prob <= 0:
+        return None
+    return 1 / prob
+
+def safe_float(x):
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+async def safe_send_message(bot_obj, chat_id, text):
+    try:
+        await bot_obj.send_message(chat_id=chat_id, text=text)
+    except TelegramError as e:
+        logging.error(f"Error enviando Telegram: {e}")
+
+def translate_reason(reason_code: str, home: str, away: str, score_home: int, score_away: int):
+    reasons = {
+        "late_draw_0_0": f"Empate 0-0 muy avanzado entre {home} y {away}. Puede haber valor en mercado de gol tardío.",
+        "one_goal_margin_late": f"Partido cerrado con diferencia de un gol entre {home} y {away}. Puede haber valor en siguientes mercados.",
+        "red_card_pressure": f"Se detectó tarjeta roja en el juego {home} vs {away}. Esto puede cambiar mucho el valor del partido.",
+        "late_draw_any": f"Empate avanzado en {home} vs {away}. Posible oportunidad en gol tardío o siguiente gol.",
+    }
+    return reasons.get(reason_code, "Se detectó una condición interesante en vivo.")
+
+def format_match_time(local_dt: datetime | None):
+    if not local_dt:
+        return "Hora no disponible"
+    return local_dt.strftime("%d/%m %I:%M %p")
+
+# =============================================================================
+# HTTP CLIENT
+# =============================================================================
+
+async def get_json(url: str, headers=None, params=None):
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(url, headers=headers, params=params)
+        resp.raise_for_status()
+        return resp.json(), resp.headers
+
+# =============================================================================
+# ODDS API
+# =============================================================================
+
+async def get_odds_for_sport(sport_key: str):
+    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
+    params = {
+        "apiKey": ODDS_API_KEY,
+        "regions": ODDS_REGIONS,
+        "markets": ODDS_MARKETS,
+        "oddsFormat": "decimal",
+    }
+
+    if ODDS_BOOKMAKERS:
+        params["bookmakers"] = ODDS_BOOKMAKERS
+
+    data, headers = await get_json(url, params=params)
+    return data, headers
+
+async def check_odds_credits(headers):
+    global odds_credits_alert_sent
+
+    remaining = headers.get("x-requests-remaining") or headers.get("X-Requests-Remaining")
+    used = headers.get("x-requests-used") or headers.get("X-Requests-Used")
+
+    logging.info(f"Odds API créditos | usados={used} | restantes={remaining}")
+
+    try:
+        remaining_int = int(remaining)
+    except Exception:
+        return
+
+    if remaining_int <= 0 and not odds_credits_alert_sent:
+        await safe_send_message(
+            bot,
+            CHAT_ID,
+            "⚠️ Tus créditos de The Odds API parecen haberse terminado. Revisa tu panel y cambia la API key si ya compraste más."
+        )
+        odds_credits_alert_sent = True
+
+def extract_h2h_market(bookmakers):
+    prices = {"home": [], "draw": [], "away": []}
+    best_odds = {"home": None, "draw": None, "away": None}
+
+    for bm in bookmakers or []:
+        for market in bm.get("markets", []):
+            if market.get("key") != "h2h":
                 continue
-            merged.setdefault(key, [])
-            for outcome in market.get("outcomes", []):
-                item = dict(outcome)
-                item["_bookmaker"] = book.get("title", "")
-                merged[key].append(item)
-    return merged
 
-def pick_best_outcome(
-    outcomes: List[Dict[str, Any]],
-    *,
-    name: Optional[str] = None,
-    point: Optional[float] = None
-) -> Optional[Dict[str, Any]]:
+            outcomes = market.get("outcomes", [])
+            for oc in outcomes:
+                name = (oc.get("name") or "").strip().lower()
+                price = safe_float(oc.get("price"))
+                if not price:
+                    continue
+
+                if name in ["draw", "empate"]:
+                    prices["draw"].append(price)
+                    if best_odds["draw"] is None or price > best_odds["draw"]:
+                        best_odds["draw"] = price
+                else:
+                    # home/away se definen luego por nombre exacto
+                    pass
+
+    return prices, best_odds
+
+def analyze_match_value(match):
+    home = match.get("home_team")
+    away = match.get("away_team")
+    bookmakers = match.get("bookmakers", [])
+
+    fair_probs = {"home": [], "draw": [], "away": []}
+    best_odds = {"home": None, "draw": None, "away": None}
+
+    for bm in bookmakers:
+        for market in bm.get("markets", []):
+            if market.get("key") != "h2h":
+                continue
+
+            for oc in market.get("outcomes", []):
+                name = (oc.get("name") or "").strip()
+                price = safe_float(oc.get("price"))
+                if not price:
+                    continue
+
+                prob = implied_prob_from_decimal(price)
+                if prob is None:
+                    continue
+
+                low = name.lower()
+                if low == home.lower():
+                    fair_probs["home"].append(prob)
+                    if best_odds["home"] is None or price > best_odds["home"]:
+                        best_odds["home"] = price
+                elif low == away.lower():
+                    fair_probs["away"].append(prob)
+                    if best_odds["away"] is None or price > best_odds["away"]:
+                        best_odds["away"] = price
+                elif low in ["draw", "empate"]:
+                    fair_probs["draw"].append(prob)
+                    if best_odds["draw"] is None or price > best_odds["draw"]:
+                        best_odds["draw"] = price
+
     candidates = []
-    for o in outcomes:
-        if name is not None and str(o.get("name")) != str(name):
+    for side in ["home", "draw", "away"]:
+        if not fair_probs[side] or not best_odds[side]:
             continue
-        if point is not None:
-            p = safe_float(o.get("point"))
-            if p is None or abs(p - point) > 1e-9:
-                continue
-        price = safe_float(o.get("price"))
-        if price is None:
+
+        avg_prob = mean(fair_probs[side])
+        fair_odds = decimal_from_prob(avg_prob)
+        offered = best_odds[side]
+
+        if not fair_odds or not offered:
             continue
-        candidates.append(o)
+
+        edge = (offered / fair_odds) - 1
+
+        candidates.append({
+            "side": side,
+            "edge": edge,
+            "fair_odds": round(fair_odds, 2),
+            "offered_odds": round(offered, 2),
+        })
 
     if not candidates:
         return None
 
-    return max(candidates, key=lambda x: safe_float(x.get("price")) or 0.0)
+    best = max(candidates, key=lambda x: x["edge"])
+    if best["edge"] < MIN_VALUE_EDGE:
+        return None
 
-# =========================================================
-# HTTP
-# =========================================================
+    label = {
+        "home": f"Gana {home}",
+        "draw": "Empate",
+        "away": f"Gana {away}",
+    }[best["side"]]
 
-async def fetch_json(
-    client: httpx.AsyncClient,
-    url: str,
-    params: Optional[Dict[str, Any]] = None,
-    headers: Optional[Dict[str, str]] = None,
-) -> Tuple[Optional[Any], Dict[str, str]]:
-    try:
-        response = await client.get(url, params=params, headers=headers, timeout=30.0)
-        response.raise_for_status()
-        return response.json(), dict(response.headers)
-    except httpx.HTTPStatusError as e:
-        logger.error("HTTP %s en %s | %s", e.response.status_code, url, e.response.text[:500])
-        return None, dict(getattr(e.response, "headers", {}))
-    except Exception as e:
-        logger.exception("Error consultando %s: %s", url, e)
-        return None, {}
-
-def read_odds_headers(headers: Dict[str, str]) -> None:
-    remaining = headers.get("x-requests-remaining") or headers.get("X-Requests-Remaining")
-    used = headers.get("x-requests-used") or headers.get("X-Requests-Used")
-    if remaining or used:
-        logger.info("Odds API | remaining=%s used=%s", remaining, used)
-
-# =========================================================
-# THE ODDS API
-# =========================================================
-
-async def get_upcoming_odds_for_league(
-    client: httpx.AsyncClient,
-    sport_key: str
-) -> List[Dict[str, Any]]:
-    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
-    params = {
-        "apiKey": ODDS_API_KEY,
-        "regions": ODDS_REGION,
-        "markets": BASE_MARKETS,
-        "oddsFormat": "decimal",
+    return {
+        "pick": label,
+        "edge": best["edge"],
+        "fair_odds": best["fair_odds"],
+        "offered_odds": best["offered_odds"],
     }
-    data, headers = await fetch_json(client, url, params=params)
-    read_odds_headers(headers)
-    return data if isinstance(data, list) else []
 
-async def get_event_extra_markets(
-    client: httpx.AsyncClient,
-    sport_key: str,
-    event_id: str
-) -> Optional[Dict[str, Any]]:
-    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/events/{event_id}/odds"
-    params = {
-        "apiKey": ODDS_API_KEY,
-        "regions": ODDS_REGION,
-        "markets": EVENT_MARKETS,
-        "oddsFormat": "decimal",
+def format_prematch_signal(match, analysis):
+    local_dt = to_local(match.get("commence_time"))
+    home = match.get("home_team")
+    away = match.get("away_team")
+    sport_title = match.get("sport_title", "Fútbol")
+
+    vip = "💎 VIP SIGNAL" if analysis["edge"] >= 0.10 else "📊 BETTING SIGNAL"
+
+    text = (
+        f"{vip}\n\n"
+        f"🏆 Liga: {sport_title}\n"
+        f"⚽ Partido: {home} vs {away}\n"
+        f"🕒 Hora: {format_match_time(local_dt)}\n"
+        f"🎯 Pick: {analysis['pick']}\n"
+        f"📈 Cuota encontrada: {analysis['offered_odds']}\n"
+        f"📉 Cuota justa estimada: {analysis['fair_odds']}\n"
+        f"🔥 Edge estimado: {round(analysis['edge'] * 100, 1)}%\n"
+    )
+    return text
+
+# =============================================================================
+# PARLAY
+# =============================================================================
+
+def build_parlay_candidates(matches):
+    """
+    Parlay simple usando solo H2H por ahora.
+    """
+    legs = []
+
+    for match in matches:
+        analysis = analyze_match_value(match)
+        if not analysis:
+            continue
+
+        odd = analysis["offered_odds"]
+        if odd < 1.45 or odd > 1.95:
+            continue
+
+        home = match.get("home_team")
+        away = match.get("away_team")
+        local_dt = to_local(match.get("commence_time"))
+
+        legs.append({
+            "fixture_id": fixture_key(home, away, local_dt),
+            "match": f"{home} vs {away}",
+            "pick": analysis["pick"],
+            "odds": odd,
+            "time": format_match_time(local_dt),
+        })
+
+    legs = sorted(legs, key=lambda x: x["odds"])
+    if len(legs) < 2:
+        return None
+
+    selected = []
+    combined = 1.0
+
+    for leg in legs:
+        if len(selected) >= 3:
+            break
+        projected = combined * leg["odds"]
+        if projected <= 4.50:
+            selected.append(leg)
+            combined = projected
+
+    if len(selected) < 2:
+        return None
+
+    if combined < 2.00 or combined > 4.50:
+        return None
+
+    return {
+        "legs": selected,
+        "combined_odds": round(combined, 2),
     }
-    data, headers = await fetch_json(client, url, params=params)
-    read_odds_headers(headers)
-    return data if isinstance(data, dict) else None
 
-# =========================================================
-# API-FOOTBALL
-# =========================================================
+def format_parlay_signal(parlay):
+    legs_text = []
+    for i, leg in enumerate(parlay["legs"], start=1):
+        legs_text.append(
+            f"{i}. {leg['match']}\n"
+            f"   🎯 {leg['pick']} @ {leg['odds']}\n"
+            f"   🕒 {leg['time']}"
+        )
+
+    return (
+        f"🔥 PARLAY DEL DÍA\n\n"
+        f"{chr(10).join(legs_text)}\n\n"
+        f"💰 Cuota combinada: {parlay['combined_odds']}"
+    )
+
+# =============================================================================
+# API FOOTBALL
+# =============================================================================
 
 API_FOOTBALL_BASE = "https://v3.football.api-sports.io"
 
-def api_football_headers() -> Dict[str, str]:
-    return {
+async def api_football_get(path: str, params=None):
+    headers = {
         "x-apisports-key": API_FOOTBALL_KEY
     }
+    url = f"{API_FOOTBALL_BASE}{path}"
+    data, _ = await get_json(url, headers=headers, params=params)
+    return data
 
-async def find_fixture_id_api_football(
-    client: httpx.AsyncClient,
-    league_id: int,
-    season: int,
-    home_team: str,
-    away_team: str,
-    event_dt: str
-) -> Optional[int]:
-    date_str = parse_dt(event_dt).astimezone(TZ).strftime("%Y-%m-%d")
-    url = f"{API_FOOTBALL_BASE}/fixtures"
-    params = {
-        "league": league_id,
-        "season": season,
-        "date": date_str,
-    }
+async def get_today_fixtures():
+    today = now_local().strftime("%Y-%m-%d")
+    fixtures = []
 
-    data, _ = await fetch_json(client, url, params=params, headers=api_football_headers())
-    if not isinstance(data, dict):
-        return None
+    for league_id, league_name in API_FOOTBALL_LEAGUES.items():
+        params = {
+            "league": league_id,
+            "date": today,
+            "timezone": "America/Mexico_City",
+        }
+        try:
+            data = await api_football_get("/fixtures", params=params)
+            for item in data.get("response", []):
+                fixture = item.get("fixture", {})
+                teams = item.get("teams", {})
+                status = fixture.get("status", {})
 
-    response = data.get("response", []) or []
-    if not response:
-        return None
+                local_dt = to_local(fixture.get("date"))
+                fixtures.append({
+                    "fixture_id": fixture.get("id"),
+                    "league_id": league_id,
+                    "league_name": league_name,
+                    "home": teams.get("home", {}).get("name"),
+                    "away": teams.get("away", {}).get("name"),
+                    "date_local": local_dt,
+                    "status_short": status.get("short"),
+                })
+        except Exception as e:
+            logging.warning(f"No se pudieron obtener fixtures de {league_name}: {e}")
 
-    home_lower = home_team.lower().strip()
-    away_lower = away_team.lower().strip()
+    return fixtures
 
-    for item in response:
-        teams = item.get("teams", {})
-        home = teams.get("home", {}).get("name", "").lower().strip()
-        away = teams.get("away", {}).get("name", "").lower().strip()
+async def get_live_matches():
+    live_matches = []
 
-        if home == home_lower and away == away_lower:
-            return item.get("fixture", {}).get("id")
+    for league_id, league_name in API_FOOTBALL_LEAGUES.items():
+        params = {
+            "live": "all",
+            "league": league_id,
+            "timezone": "America/Mexico_City",
+        }
+        try:
+            data = await api_football_get("/fixtures", params=params)
+            for item in data.get("response", []):
+                fixture = item.get("fixture", {})
+                teams = item.get("teams", {})
+                goals = item.get("goals", {})
+                status = fixture.get("status", {})
+                score = item.get("score", {})
 
-    for item in response:
-        teams = item.get("teams", {})
-        home = teams.get("home", {}).get("name", "").lower().strip()
-        away = teams.get("away", {}).get("name", "").lower().strip()
+                live_matches.append({
+                    "fixture_id": fixture.get("id"),
+                    "league_name": league_name,
+                    "home": teams.get("home", {}).get("name"),
+                    "away": teams.get("away", {}).get("name"),
+                    "home_goals": goals.get("home", 0) or 0,
+                    "away_goals": goals.get("away", 0) or 0,
+                    "minute": status.get("elapsed"),
+                    "status_short": status.get("short"),
+                    "score_raw": score,
+                })
+        except Exception as e:
+            logging.warning(f"No se pudieron obtener partidos en vivo de {league_name}: {e}")
 
-        if home_lower in home or home in home_lower:
-            if away_lower in away or away in away_lower:
-                return item.get("fixture", {}).get("id")
+    return live_matches
 
-    return None
-
-async def get_prediction_api_football(
-    client: httpx.AsyncClient,
-    fixture_id: int
-) -> Optional[Dict[str, Any]]:
-    url = f"{API_FOOTBALL_BASE}/predictions"
-    params = {"fixture": fixture_id}
-    data, _ = await fetch_json(client, url, params=params, headers=api_football_headers())
-
-    if not isinstance(data, dict):
-        return None
-
-    response = data.get("response", []) or []
-    if not response:
-        return None
-
-    return response[0]
-
-# =========================================================
-# INTELIGENCIA API-FOOTBALL
-# =========================================================
-
-def percent_to_float(v: Any) -> Optional[float]:
-    if v is None:
-        return None
-    s = str(v).replace("%", "").strip()
+async def get_fixture_events(fixture_id: int):
     try:
-        return float(s)
-    except Exception:
-        return None
-
-def extract_prediction_signals(pred: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    result = {
-        "winner_name": None,
-        "winner_comment": None,
-        "advice": None,
-        "goals_home": None,
-        "goals_away": None,
-        "under_over": None,
-        "percent_home": None,
-        "percent_draw": None,
-        "percent_away": None,
-    }
-
-    if not pred:
-        return result
-
-    predictions = pred.get("predictions", {}) or {}
-    winner = predictions.get("winner", {}) or {}
-    goals = predictions.get("goals", {}) or {}
-    percent = predictions.get("percent", {}) or {}
-
-    result["winner_name"] = winner.get("name")
-    result["winner_comment"] = winner.get("comment")
-    result["advice"] = predictions.get("advice")
-    result["goals_home"] = goals.get("home")
-    result["goals_away"] = goals.get("away")
-    result["under_over"] = predictions.get("under_over")
-    result["percent_home"] = percent.get("home")
-    result["percent_draw"] = percent.get("draw")
-    result["percent_away"] = percent.get("away")
-
-    return result
-
-def prediction_boost_for_pick(pick: Dict[str, Any], intel: Dict[str, Any], home_team: str, away_team: str) -> float:
-    score = 0.0
-    label = pick["label"].lower()
-
-    advice = (intel.get("advice") or "").lower()
-    winner_name = (intel.get("winner_name") or "").lower()
-    under_over = str(intel.get("under_over") or "").lower()
-
-    home_lower = home_team.lower()
-    away_lower = away_team.lower()
-
-    if home_lower in label and winner_name == home_lower:
-        score += 12
-    if away_lower in label and winner_name == away_lower:
-        score += 12
-
-    if "o empate" in label:
-        if home_lower in label and winner_name == home_lower:
-            score += 10
-        if away_lower in label and winner_name == away_lower:
-            score += 10
-
-    if "under 3.5 goles" in label and "under" in under_over:
-        score += 10
-    if "over 1.5 goles" in label and "over" in under_over:
-        score += 8
-    if "over 2.5 goles" in label and "over" in under_over:
-        score += 10
-
-    if "ambos anotan" in label and "goals" in advice:
-        score += 4
-    if "ambos no anotan" in label and "under" in advice:
-        score += 4
-
-    pct_home = percent_to_float(intel.get("percent_home"))
-    pct_away = percent_to_float(intel.get("percent_away"))
-
-    if "tarjetas" in label and pct_home is not None and pct_away is not None:
-        if abs(pct_home - pct_away) <= 12:
-            score += 5
-
-    if "corners" in label and "over" in under_over:
-        score += 5
-
-    return score
-
-def base_pick_score(pick: Dict[str, Any]) -> float:
-    odds = float(pick["odds"])
-    market = pick.get("market", "")
-    score = 100.0
-
-    score -= abs(odds - 1.65) * 20
-
-    if market == "double_chance":
-        score += 10
-    elif market == "totals_goals":
-        score += 9
-    elif market == "btts":
-        score += 7
-    elif market == "cards":
-        score += 6
-    elif market == "corners":
-        score += 5
-    elif market == "h2h":
-        score += 4
-
-    if odds < 1.35:
-        score -= 8
-    if odds > 2.10:
-        score -= 10
-
-    return round(score, 2)
-
-# =========================================================
-# BUILD PICKS
-# =========================================================
-
-def build_goal_picks(merged_markets: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
-    picks = []
-    totals = merged_markets.get("totals", []) + merged_markets.get("alternate_totals", [])
-
-    for side, line in PREFERRED_GOAL_LINES:
-        outcome = pick_best_outcome(totals, name=side, point=line)
-        if not outcome:
-            continue
-        price = safe_float(outcome.get("price"))
-        if price is None or not valid_pick_odds(price):
-            continue
-
-        reason = "Línea de goles utilizable para previa."
-        if side == "Under":
-            reason = "Partido con ruta razonable a pocos goles."
-        elif line == 1.5:
-            reason = "Línea accesible para que el juego tenga al menos dos goles."
-        elif line == 2.5:
-            reason = "Partido con opción real de superar la línea de goles."
-
-        picks.append({
-            "market": "totals_goals",
-            "label": f"{side} {line:g} goles",
-            "odds": price,
-            "reason_es": reason,
-        })
-    return picks
-
-def build_btts_picks(_: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
-    # BTTS se dejó fuera del endpoint base para evitar INVALID_MARKET
-    return []
-
-def build_h2h_picks(merged_markets: Dict[str, List[Dict[str, Any]]], home: str, away: str) -> List[Dict[str, Any]]:
-    picks = []
-    outcomes = merged_markets.get("h2h", [])
-
-    for team in [home, away]:
-        outcome = pick_best_outcome(outcomes, name=team)
-        if not outcome:
-            continue
-        price = safe_float(outcome.get("price"))
-        if price is None or not valid_pick_odds(price):
-            continue
-
-        picks.append({
-            "market": "h2h",
-            "label": f"{team} gana",
-            "odds": price,
-            "reason_es": f"{team} sale con cuota utilizable como favorito ligero.",
-        })
-
-    return picks
-
-def build_double_chance_picks(merged_markets: Dict[str, List[Dict[str, Any]]], home: str, away: str) -> List[Dict[str, Any]]:
-    picks = []
-    outcomes = merged_markets.get("double_chance", [])
-
-    targets = [
-        (f"{home} or Draw", f"{home} o empate", f"{home} tiene respaldo cubriendo también el empate."),
-        (f"{away} or Draw", f"{away} o empate", f"{away} tiene respaldo cubriendo también el empate."),
-    ]
-
-    for raw_name, label, reason in targets:
-        outcome = pick_best_outcome(outcomes, name=raw_name)
-        if not outcome:
-            continue
-        price = safe_float(outcome.get("price"))
-        if price is None or not valid_pick_odds(price):
-            continue
-
-        picks.append({
-            "market": "double_chance",
-            "label": label,
-            "odds": price,
-            "reason_es": reason,
-        })
-
-    return picks
-
-def build_corners_picks(merged_markets: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
-    picks = []
-    outcomes = merged_markets.get("alternate_totals_corners", [])
-
-    for side, line in PREFERRED_CORNERS_LINES:
-        outcome = pick_best_outcome(outcomes, name=side, point=line)
-        if not outcome:
-            continue
-        price = safe_float(outcome.get("price"))
-        if price is None or not valid_pick_odds(price):
-            continue
-
-        picks.append({
-            "market": "corners",
-            "label": f"{side} {line:g} corners",
-            "odds": price,
-            "reason_es": "Línea de corners interesante para previa.",
-        })
-
-    return picks
-
-def build_cards_picks(merged_markets: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
-    picks = []
-    outcomes = merged_markets.get("alternate_totals_cards", [])
-
-    for side, line in PREFERRED_CARDS_LINES:
-        outcome = pick_best_outcome(outcomes, name=side, point=line)
-        if not outcome:
-            continue
-        price = safe_float(outcome.get("price"))
-        if price is None or not valid_pick_odds(price):
-            continue
-
-        picks.append({
-            "market": "cards",
-            "label": f"{side} {line:g} tarjetas",
-            "odds": price,
-            "reason_es": "Línea de tarjetas atractiva para previa.",
-        })
-
-    return picks
-
-def build_all_candidate_picks(
-    game: Dict[str, Any],
-    base_bookmakers: List[Dict[str, Any]],
-    extra_bookmakers: List[Dict[str, Any]]
-) -> List[Dict[str, Any]]:
-    merged = market_outcomes_by_key(base_bookmakers)
-    merged_extra = market_outcomes_by_key(extra_bookmakers)
-
-    for k, v in merged_extra.items():
-        merged.setdefault(k, [])
-        merged[k].extend(v)
-
-    home = game.get("home_team", "")
-    away = game.get("away_team", "")
-
-    picks: List[Dict[str, Any]] = []
-    picks.extend(build_goal_picks(merged))
-    picks.extend(build_btts_picks(merged))
-    picks.extend(build_h2h_picks(merged, home, away))
-    picks.extend(build_double_chance_picks(merged, home, away))
-    picks.extend(build_corners_picks(merged))
-    picks.extend(build_cards_picks(merged))
-
-    return picks
-
-# =========================================================
-# COMBOS
-# =========================================================
-
-def picks_conflict(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
-    la = a["label"].lower()
-    lb = b["label"].lower()
-
-    if la == lb:
-        return True
-
-    if ("ambos anotan" in la and "ambos no anotan" in lb) or ("ambos anotan" in lb and "ambos no anotan" in la):
-        return True
-
-    if ("gana" in la and "o empate" in lb) or ("gana" in lb and "o empate" in la):
-        return True
-
-    if a.get("market") == b.get("market") and a.get("market") in {"cards", "corners", "double_chance"}:
-        return True
-
-    return False
-
-def combo_is_valid(picks: List[Dict[str, Any]]) -> bool:
-    for i in range(len(picks)):
-        for j in range(i + 1, len(picks)):
-            if picks_conflict(picks[i], picks[j]):
-                return False
-    return True
-
-def choose_best_combo(picks: List[Dict[str, Any]]) -> Optional[Tuple[List[Dict[str, Any]], float]]:
-    best_combo = None
-    best_score = -1e9
-
-    for i in range(len(picks)):
-        for j in range(i + 1, len(picks)):
-            combo = [picks[i], picks[j]]
-            if not combo_is_valid(combo):
-                continue
-            total = combo_odds(combo)
-            if not valid_combo_odds(total):
-                continue
-            score = sum(p["score"] for p in combo)
-            if 2.10 <= total <= 3.80:
-                score += 10
-            if score > best_score:
-                best_score = score
-                best_combo = (combo, total)
-
-    for i in range(len(picks)):
-        for j in range(i + 1, len(picks)):
-            for k in range(j + 1, len(picks)):
-                combo = [picks[i], picks[j], picks[k]]
-                if not combo_is_valid(combo):
-                    continue
-                total = combo_odds(combo)
-                if not valid_combo_odds(total):
-                    continue
-                score = sum(p["score"] for p in combo)
-                if 2.30 <= total <= 4.20:
-                    score += 14
-                if score > best_score:
-                    best_score = score
-                    best_combo = (combo, total)
-
-    return best_combo
-
-# =========================================================
-# TELEGRAM
-# =========================================================
-
-def format_signal(game: Dict[str, Any], picks: List[Dict[str, Any]], total_price: float, intel: Dict[str, Any]) -> str:
-    lines = []
-    lines.append("📊 SEÑAL PREPARTIDO PRO")
-    lines.append("")
-    lines.append(f"🏟 Partido: {fixture_name(game)}")
-    lines.append(f"🏆 Liga: {game.get('sport_title', game.get('sport_key', ''))}")
-    lines.append(f"🕒 Hora: {format_local_time(game['commence_time'])}")
-    lines.append("")
-
-    if intel.get("advice"):
-        lines.append(f"🧠 Lectura API-Football: {intel['advice']}")
-        lines.append("")
-
-    lines.append("✅ Picks:")
-    for p in picks:
-        lines.append(f"- {p['label']} @ {p['odds']:.2f}")
-
-    lines.append("")
-    lines.append(f"🎯 Cuota combinada: {total_price:.2f}")
-    lines.append("")
-    lines.append("📝 Motivos:")
-    for p in picks:
-        lines.append(f"• {p['reason_es']}")
-    lines.append("")
-    lines.append("💰 Stake sugerido: 0.5u a 1u")
-
-    return "\n".join(lines)
-
-async def send_text(text: str) -> bool:
-    try:
-        await bot.send_message(chat_id=CHAT_ID, text=text)
-        return True
-    except TelegramError as e:
-        logger.error("TelegramError: %s", e)
-        return False
+        data = await api_football_get("/fixtures/events", params={"fixture": fixture_id})
+        return data.get("response", [])
     except Exception as e:
-        logger.exception("Error inesperado enviando Telegram: %s", e)
-        return False
+        logging.warning(f"No se pudieron obtener eventos del fixture {fixture_id}: {e}")
+        return []
 
-# =========================================================
-# FLUJO PRINCIPAL
-# =========================================================
+# =============================================================================
+# LÓGICA DE SEÑALES EN VIVO
+# =============================================================================
 
-async def collect_upcoming_games(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
-    all_games = []
+async def analyze_live_match(match):
+    fixture_id = match["fixture_id"]
+    home = match["home"]
+    away = match["away"]
+    hg = int(match["home_goals"])
+    ag = int(match["away_goals"])
+    minute = match["minute"] or 0
 
-    for league in LEAGUES:
-        games = await get_upcoming_odds_for_league(client, league)
-        for game in games:
-            if is_within_window(game.get("commence_time", ""), PREMATCH_WINDOW_HOURS):
-                all_games.append(game)
+    if minute < LIVE_MINUTE_THRESHOLD:
+        return []
 
-    all_games.sort(key=lambda g: g.get("commence_time", "9999"))
-    return all_games
+    signals = []
 
-async def enrich_with_api_football_intel(
-    client: httpx.AsyncClient,
-    game: Dict[str, Any]
-) -> Dict[str, Any]:
-    sport_key = game.get("sport_key")
-    mapping = API_FOOTBALL_LEAGUE_MAP.get(sport_key)
-    if not mapping:
-        return {}
+    # 0-0 tardío
+    if hg == 0 and ag == 0 and minute >= LIVE_DRAW_ONLY_MINUTE:
+        signals.append("late_draw_0_0")
 
-    fixture_id = await find_fixture_id_api_football(
-        client=client,
-        league_id=mapping["league_id"],
-        season=mapping["season"],
-        home_team=game.get("home_team", ""),
-        away_team=game.get("away_team", ""),
-        event_dt=game.get("commence_time", ""),
+    # empate tardío en general
+    if hg == ag and minute >= LIVE_DRAW_ONLY_MINUTE:
+        signals.append("late_draw_any")
+
+    # diferencia de un gol avanzada
+    if abs(hg - ag) == 1 and minute >= LIVE_MINUTE_THRESHOLD:
+        signals.append("one_goal_margin_late")
+
+    # revisar roja
+    events = await get_fixture_events(fixture_id)
+    red_found = False
+    for ev in events:
+        detail = (ev.get("detail") or "").lower()
+        typ = (ev.get("type") or "").lower()
+        if "red card" in detail or "red card" in typ or "tarjeta roja" in detail:
+            red_found = True
+            break
+    if red_found and minute >= LIVE_MINUTE_THRESHOLD:
+        signals.append("red_card_pressure")
+
+    return signals
+
+def format_live_signal(match, reason_code):
+    home = match["home"]
+    away = match["away"]
+    hg = match["home_goals"]
+    ag = match["away_goals"]
+    minute = match["minute"]
+    league = match["league_name"]
+
+    reason_text = translate_reason(reason_code, home, away, hg, ag)
+
+    vip = "💎 SEÑAL VIP EN VIVO" if reason_code in ["red_card_pressure", "late_draw_0_0"] else "🔴 SEÑAL EN VIVO"
+
+    return (
+        f"{vip}\n\n"
+        f"🏆 Liga: {league}\n"
+        f"⚽ Partido: {home} vs {away}\n"
+        f"⏱ Minuto: {minute}'\n"
+        f"📊 Marcador: {home} {hg}-{ag} {away}\n"
+        f"🧠 Motivo: {reason_text}"
     )
-    if not fixture_id:
-        return {}
 
-    pred = await get_prediction_api_football(client, fixture_id)
-    return extract_prediction_signals(pred)
+# =============================================================================
+# CICLOS
+# =============================================================================
 
-async def build_signal_for_game(
-    client: httpx.AsyncClient,
-    game: Dict[str, Any]
-) -> Optional[Tuple[List[Dict[str, Any]], float, Dict[str, Any]]]:
-    sport_key = game.get("sport_key")
-    event_id = game.get("id")
-    if not sport_key or not event_id:
-        return None
+async def process_prematch():
+    if not ENABLE_PREMATCH:
+        return []
 
-    event_data = await get_event_extra_markets(client, sport_key, event_id)
-    extra_bookmakers = event_data.get("bookmakers", []) if isinstance(event_data, dict) else []
-    base_bookmakers = game.get("bookmakers", []) or []
+    all_matches = []
 
-    candidate_picks = build_all_candidate_picks(game, base_bookmakers, extra_bookmakers)
-    if len(candidate_picks) < 2:
-        return None
+    for sport_key in ODDS_SPORT_KEYS:
+        try:
+            matches, headers = await get_odds_for_sport(sport_key)
+            await check_odds_credits(headers)
+            all_matches.extend(matches)
+        except Exception as e:
+            logging.warning(f"Error obteniendo odds de {sport_key}: {e}")
 
-    intel = await enrich_with_api_football_intel(client, game)
+    sent_messages = []
 
-    home = game.get("home_team", "")
-    away = game.get("away_team", "")
+    now_dt = now_local()
+    limit_dt = now_dt + timedelta(hours=PRE_MATCH_WINDOW_HOURS)
 
-    for p in candidate_picks:
-        p["score"] = base_pick_score(p) + prediction_boost_for_pick(p, intel, home, away)
+    for match in all_matches:
+        local_dt = to_local(match.get("commence_time"))
+        if not local_dt:
+            continue
 
-    candidate_picks.sort(key=lambda x: x["score"], reverse=True)
+        if not (now_dt <= local_dt <= limit_dt):
+            continue
 
-    combo = choose_best_combo(candidate_picks)
-    if not combo:
-        return None
+        home = match.get("home_team")
+        away = match.get("away_team")
+        key = fixture_key(home, away, local_dt)
 
-    picks, total = combo
-    return picks, total, intel
-async def run_cycle() -> bool:
-    """
-    Devuelve True si debe dormir hasta mañana.
-    Devuelve False si debe seguir en ciclos normales.
-    """
-    global last_no_fixtures_alert_date, last_fixtures_found_alert_date
+        analysis = analyze_match_value(match)
+        if not analysis:
+            continue
 
-    logger.info("Iniciando ciclo V13.2 PRO...")
-    sent_count = 0
+        dedupe_key = f"{key}|{analysis['pick']}"
+        if dedupe_key in sent_prematch_signals:
+            continue
 
-    if not is_within_working_hours():
-        sleep_seconds = seconds_until_next_start()
-        logger.info(
-            "Fuera de horario de trabajo. Durmiendo %s segundos hasta las %02d:00.",
-            sleep_seconds,
-            WORK_START_HOUR
-        )
-        await asyncio.sleep(sleep_seconds)
-        return False
+        text = format_prematch_signal(match, analysis)
+        await safe_send_message(bot, CHAT_ID, text)
+        sent_prematch_signals.add(dedupe_key)
+        sent_messages.append(text)
 
-    async with httpx.AsyncClient() as client:
-        games = await collect_upcoming_games(client)
-        today_str = now_local().strftime("%Y-%m-%d")
+    return all_matches
 
-        if not games:
-            if SEND_NO_FIXTURES_MESSAGE and last_no_fixtures_alert_date != today_str:
-                msg = (
-                    "📅 Hoy no encontré partidos en tus ligas configuradas "
-                    "(Liga MX, Premier y Champions) dentro de la ventana de revisión.\n\n"
-                    f"😴 El bot se dormirá y volverá a revisar mañana a las {WORK_START_HOUR}:00."
-                )
-                await send_text(msg)
-                last_no_fixtures_alert_date = today_str
+async def process_parlay(all_matches):
+    if not ENABLE_PARLAY:
+        return
 
-            logger.info("No hay partidos en ventana. El bot dormirá hasta mañana.")
-            return True
+    parlay = build_parlay_candidates(all_matches)
+    if not parlay:
+        return
 
-        # Aviso de que sí hay partidos hoy, solo una vez por día
-        if last_fixtures_found_alert_date != today_str:
-            unique_matches = []
-            seen_ids = set()
+    parlay_key = "|".join([f"{x['fixture_id']}::{x['pick']}" for x in parlay["legs"]])
+    if parlay_key in sent_parley_signals:
+        return
 
-            for game in games:
-                gid = game.get("id")
-                if gid in seen_ids:
+    text = format_parlay_signal(parlay)
+    await safe_send_message(bot, CHAT_ID, text)
+    sent_parley_signals.add(parlay_key)
+
+async def process_live():
+    if not ENABLE_LIVE:
+        return
+
+    live_matches = await get_live_matches()
+
+    for match in live_matches:
+        try:
+            signals = await analyze_live_match(match)
+            for reason_code in signals:
+                dedupe_key = f"{match['fixture_id']}|{reason_code}"
+                if dedupe_key in sent_live_signals:
                     continue
-                seen_ids.add(gid)
-                unique_matches.append(
-                    f"• {fixture_name(game)} — {format_local_time(game['commence_time'])}"
-                )
 
-            preview = "\n".join(unique_matches[:8])
+                text = format_live_signal(match, reason_code)
+                await safe_send_message(bot, CHAT_ID, text)
+                sent_live_signals.add(dedupe_key)
+        except Exception as e:
+            logging.warning(f"Error analizando partido en vivo {match.get('fixture_id')}: {e}")
 
-            msg = (
-                "📅 Sí encontré partidos para hoy en tus ligas configuradas.\n\n"
-                "👀 Estaré analizando previas y si encuentro buenos parleys o señales prepartido te los mando.\n\n"
-                "Partidos detectados:\n"
-                f"{preview}"
+async def send_daily_fixture_status(fixtures):
+    global last_fixtures_found_alert_date, last_no_fixtures_alert_date
+
+    today_str = now_local().strftime("%Y-%m-%d")
+
+    if not fixtures:
+        if last_no_fixtures_alert_date != today_str:
+            await safe_send_message(
+                bot,
+                CHAT_ID,
+                "📭 Hoy no encontré partidos de tus ligas configuradas. El bot dormirá hasta mañana para ahorrar créditos."
             )
-            await send_text(msg)
-            last_fixtures_found_alert_date = today_str
+            last_no_fixtures_alert_date = today_str
+        return
 
-        games = games[:MAX_EVENTS_TO_DEEP_SCAN_PER_CYCLE]
+    if last_fixtures_found_alert_date != today_str:
+        leagues_found = sorted(list({f.get("league_name", "Liga") for f in fixtures}))
+        leagues_text = ", ".join(leagues_found) if leagues_found else "tus ligas configuradas"
 
-        for game in games:
-            if sent_count >= MAX_MESSAGES_PER_CYCLE:
-                logger.info("Límite de mensajes por ciclo alcanzado.")
-                break
+        await safe_send_message(
+            bot,
+            CHAT_ID,
+            f"📅 Encontré partidos para hoy en {leagues_text}. El bot queda atento para mandarte señales y parleys."
+        )
+        last_fixtures_found_alert_date = today_str
 
-            try:
-                result = await build_signal_for_game(client, game)
-                if not result:
-                    continue
+async def run_cycle():
+    now_dt = now_local()
+    current_hour = now_dt.hour
 
-                picks, total, intel = result
-                key = dedupe_key(game, picks)
-                if key in sent_signal_keys:
-                    logger.info("Señal duplicada omitida: %s", key)
-                    continue
+    # Antes de las 7 AM -> dormir
+    if current_hour < ACTIVE_START_HOUR:
+        logging.info("Fuera de horario. Esperando a las 7 AM.")
+        return True
 
-                msg = format_signal(game, picks, total, intel)
-                ok = await send_text(msg)
-                if ok:
-                    sent_signal_keys.add(key)
-                    sent_count += 1
-                    logger.info("Señal enviada: %s", fixture_name(game))
+    # 10 PM o más -> dormir hasta mañana
+    if current_hour >= ACTIVE_END_HOUR:
+        logging.info("Después de las 10 PM. Durmiendo hasta mañana.")
+        return True
 
-            except Exception as e:
-                logger.exception("Error procesando %s: %s", fixture_name(game), e)
+    fixtures = await get_today_fixtures()
+    await send_daily_fixture_status(fixtures)
 
+    if not fixtures:
+        return True
+
+    all_matches = await process_prematch()
+    await process_parlay(all_matches)
+    await process_live()
+
+    save_state()
     return False
 
-async def main() -> None:
-    logger.info("Bot V13.2 PRO INTELIGENTE iniciado")
-    logger.info("Live habilitado: %s", ENABLE_LIVE_SIGNALS)
-    logger.info("Horario de trabajo: %02d:00 a %02d:00", WORK_START_HOUR, WORK_END_HOUR)
+def seconds_until_next_active_window():
+    now_dt = now_local()
+
+    if now_dt.hour >= ACTIVE_END_HOUR:
+        target = (now_dt + timedelta(days=1)).replace(
+            hour=ACTIVE_START_HOUR, minute=0, second=0, microsecond=0
+        )
+    elif now_dt.hour < ACTIVE_START_HOUR:
+        target = now_dt.replace(
+            hour=ACTIVE_START_HOUR, minute=0, second=0, microsecond=0
+        )
+    else:
+        return CYCLE_INTERVAL
+
+    return max(60, int((target - now_dt).total_seconds()))
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+async def main():
+    load_state()
+    logging.info("Iniciando ciclo V13.3 PRO...")
 
     while True:
         try:
             should_sleep_until_tomorrow = await run_cycle()
 
             if should_sleep_until_tomorrow:
-                sleep_seconds = seconds_until_tomorrow_start()
-                logger.info(
-                    "Durmiendo hasta mañana a las %02d:00. Segundos: %s",
-                    WORK_START_HOUR,
-                    sleep_seconds
-                )
+                sleep_seconds = seconds_until_next_active_window()
+                logging.info(f"Durmiendo {sleep_seconds} segundos hasta siguiente ventana activa.")
                 await asyncio.sleep(sleep_seconds)
-                continue
+            else:
+                logging.info(f"Esperando {CYCLE_INTERVAL} segundos para el siguiente ciclo.")
+                await asyncio.sleep(CYCLE_INTERVAL)
 
         except Exception as e:
-            logger.exception("Error en loop principal: %s", e)
+            logging.exception(f"Error en loop principal: {e}")
             await asyncio.sleep(60)
-
-        if is_within_working_hours():
-            await asyncio.sleep(SCAN_INTERVAL_SECONDS)
 
 if __name__ == "__main__":
     asyncio.run(main())
