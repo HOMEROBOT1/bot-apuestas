@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from statistics import mean
 from zoneinfo import ZoneInfo
 
@@ -30,7 +30,7 @@ API_FOOTBALL_KEY = "c455630d0023ef208f93dd0567164905"
 
 DB_PATH = os.getenv("DB_PATH", "bot_state.txt").strip()
 
-CYCLE_INTERVAL = int(os.getenv("CYCLE_INTERVAL", "900"))  # 15 min
+CYCLE_INTERVAL = int(os.getenv("CYCLE_INTERVAL", "900"))
 LOCAL_TZ = ZoneInfo(os.getenv("LOCAL_TZ", "America/Mexico_City"))
 
 ODDS_REGIONS = os.getenv("ODDS_REGIONS", "uk").strip()
@@ -81,7 +81,8 @@ last_fixtures_found_alert_date = None
 last_no_fixtures_alert_date = None
 
 # =============================================================================
-# LIGAS PERMITIDAS
+# LIGAS
+# season = temporada de arranque
 # =============================================================================
 
 ODDS_SPORT_KEYS = [
@@ -91,9 +92,9 @@ ODDS_SPORT_KEYS = [
 ]
 
 API_FOOTBALL_LEAGUES = {
-    262: "Liga MX",
-    39: "Premier League",
-    2: "Champions League",
+    262: {"name": "Liga MX", "season": 2025},
+    39: {"name": "Premier League", "season": 2025},
+    2: {"name": "Champions League", "season": 2025},
 }
 
 # =============================================================================
@@ -104,9 +105,6 @@ def now_local():
     return datetime.now(LOCAL_TZ)
 
 def to_local(dt_str: str):
-    """
-    Convierte ISO UTC a hora local.
-    """
     if not dt_str:
         return None
     try:
@@ -114,15 +112,6 @@ def to_local(dt_str: str):
         return dt.astimezone(LOCAL_TZ)
     except Exception:
         return None
-
-def parse_minute(text):
-    if text is None:
-        return None
-    txt = str(text).strip()
-    m = re.search(r"(\d+)", txt)
-    if m:
-        return int(m.group(1))
-    return None
 
 def normalize_team(name: str) -> str:
     return re.sub(r"\s+", " ", (name or "").strip().lower())
@@ -132,34 +121,6 @@ def fixture_key(home: str, away: str, kickoff_local: datetime | None):
     if kickoff_local:
         base += "|" + kickoff_local.strftime("%Y-%m-%d %H:%M")
     return base
-
-def save_state():
-    try:
-        with open(DB_PATH, "w", encoding="utf-8") as f:
-            for item in sent_live_signals:
-                f.write(f"LIVE::{item}\n")
-            for item in sent_prematch_signals:
-                f.write(f"PRE::{item}\n")
-            for item in sent_parley_signals:
-                f.write(f"PAR::{item}\n")
-    except Exception as e:
-        logging.warning(f"No se pudo guardar estado: {e}")
-
-def load_state():
-    if not os.path.exists(DB_PATH):
-        return
-    try:
-        with open(DB_PATH, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith("LIVE::"):
-                    sent_live_signals.add(line.replace("LIVE::", "", 1))
-                elif line.startswith("PRE::"):
-                    sent_prematch_signals.add(line.replace("PRE::", "", 1))
-                elif line.startswith("PAR::"):
-                    sent_parley_signals.add(line.replace("PAR::", "", 1))
-    except Exception as e:
-        logging.warning(f"No se pudo cargar estado: {e}")
 
 def implied_prob_from_decimal(odds: float):
     if not odds or odds <= 1:
@@ -177,6 +138,11 @@ def safe_float(x):
     except Exception:
         return None
 
+def format_match_time(local_dt: datetime | None):
+    if not local_dt:
+        return "Hora no disponible"
+    return local_dt.strftime("%d/%m %I:%M %p")
+
 async def safe_send_message(bot_obj, chat_id, text):
     try:
         await bot_obj.send_message(chat_id=chat_id, text=text)
@@ -192,13 +158,60 @@ def translate_reason(reason_code: str, home: str, away: str, score_home: int, sc
     }
     return reasons.get(reason_code, "Se detectó una condición interesante en vivo.")
 
-def format_match_time(local_dt: datetime | None):
-    if not local_dt:
-        return "Hora no disponible"
-    return local_dt.strftime("%d/%m %I:%M %p")
+# =============================================================================
+# ESTADO PERSISTENTE
+# =============================================================================
+
+def save_state():
+    try:
+        with open(DB_PATH, "w", encoding="utf-8") as f:
+            for item in sent_live_signals:
+                f.write(f"LIVE::{item}\n")
+            for item in sent_prematch_signals:
+                f.write(f"PRE::{item}\n")
+            for item in sent_parley_signals:
+                f.write(f"PAR::{item}\n")
+
+            if last_fixtures_found_alert_date:
+                f.write(f"FOUND::{last_fixtures_found_alert_date}\n")
+
+            if last_no_fixtures_alert_date:
+                f.write(f"NOFIX::{last_no_fixtures_alert_date}\n")
+
+    except Exception as e:
+        logging.warning(f"No se pudo guardar estado: {e}")
+
+def load_state():
+    global last_fixtures_found_alert_date, last_no_fixtures_alert_date
+
+    if not os.path.exists(DB_PATH):
+        return
+
+    try:
+        with open(DB_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+
+                if line.startswith("LIVE::"):
+                    sent_live_signals.add(line.replace("LIVE::", "", 1))
+
+                elif line.startswith("PRE::"):
+                    sent_prematch_signals.add(line.replace("PRE::", "", 1))
+
+                elif line.startswith("PAR::"):
+                    sent_parley_signals.add(line.replace("PAR::", "", 1))
+
+                elif line.startswith("FOUND::"):
+                    last_fixtures_found_alert_date = line.replace("FOUND::", "", 1)
+
+                elif line.startswith("NOFIX::"):
+                    last_no_fixtures_alert_date = line.replace("NOFIX::", "", 1)
+
+    except Exception as e:
+        logging.warning(f"No se pudo cargar estado: {e}")
 
 # =============================================================================
-# HTTP CLIENT
+# HTTP
 # =============================================================================
 
 async def get_json(url: str, headers=None, params=None):
@@ -208,7 +221,7 @@ async def get_json(url: str, headers=None, params=None):
         return resp.json(), resp.headers
 
 # =============================================================================
-# ODDS API
+# THE ODDS API
 # =============================================================================
 
 async def get_odds_for_sport(sport_key: str):
@@ -246,32 +259,6 @@ async def check_odds_credits(headers):
             "⚠️ Tus créditos de The Odds API parecen haberse terminado. Revisa tu panel y cambia la API key si ya compraste más."
         )
         odds_credits_alert_sent = True
-
-def extract_h2h_market(bookmakers):
-    prices = {"home": [], "draw": [], "away": []}
-    best_odds = {"home": None, "draw": None, "away": None}
-
-    for bm in bookmakers or []:
-        for market in bm.get("markets", []):
-            if market.get("key") != "h2h":
-                continue
-
-            outcomes = market.get("outcomes", [])
-            for oc in outcomes:
-                name = (oc.get("name") or "").strip().lower()
-                price = safe_float(oc.get("price"))
-                if not price:
-                    continue
-
-                if name in ["draw", "empate"]:
-                    prices["draw"].append(price)
-                    if best_odds["draw"] is None or price > best_odds["draw"]:
-                        best_odds["draw"] = price
-                else:
-                    # home/away se definen luego por nombre exacto
-                    pass
-
-    return prices, best_odds
 
 def analyze_match_value(match):
     home = match.get("home_team")
@@ -323,7 +310,6 @@ def analyze_match_value(match):
             continue
 
         edge = (offered / fair_odds) - 1
-
         candidates.append({
             "side": side,
             "edge": edge,
@@ -376,9 +362,6 @@ def format_prematch_signal(match, analysis):
 # =============================================================================
 
 def build_parlay_candidates(matches):
-    """
-    Parlay simple usando solo H2H por ahora.
-    """
     legs = []
 
     for match in matches:
@@ -461,46 +444,63 @@ async def get_today_fixtures():
     today = now_local().strftime("%Y-%m-%d")
     fixtures = []
 
-    for league_id, league_name in API_FOOTBALL_LEAGUES.items():
+    for league_id, cfg in API_FOOTBALL_LEAGUES.items():
         params = {
             "league": league_id,
+            "season": cfg["season"],
             "date": today,
             "timezone": "America/Mexico_City",
         }
+
         try:
             data = await api_football_get("/fixtures", params=params)
-            for item in data.get("response", []):
+            resp = data.get("response", [])
+
+            logging.info(
+                f"Fixtures {cfg['name']} | date={today} | season={cfg['season']} | encontrados={len(resp)}"
+            )
+
+            for item in resp:
                 fixture = item.get("fixture", {})
                 teams = item.get("teams", {})
                 status = fixture.get("status", {})
 
-                local_dt = to_local(fixture.get("date"))
                 fixtures.append({
                     "fixture_id": fixture.get("id"),
                     "league_id": league_id,
-                    "league_name": league_name,
+                    "league_name": cfg["name"],
                     "home": teams.get("home", {}).get("name"),
                     "away": teams.get("away", {}).get("name"),
-                    "date_local": local_dt,
+                    "date_local": to_local(fixture.get("date")),
                     "status_short": status.get("short"),
                 })
-        except Exception as e:
-            logging.warning(f"No se pudieron obtener fixtures de {league_name}: {e}")
 
+        except Exception as e:
+            logging.warning(f"No se pudieron obtener fixtures de {cfg['name']}: {e}")
+
+    logging.info(f"Total fixtures encontrados hoy: {len(fixtures)}")
     return fixtures
 
 async def get_live_matches():
     live_matches = []
 
-    for league_id, league_name in API_FOOTBALL_LEAGUES.items():
+    for league_id, cfg in API_FOOTBALL_LEAGUES.items():
         params = {
             "live": "all",
             "league": league_id,
+            "season": cfg["season"],
             "timezone": "America/Mexico_City",
         }
+
         try:
             data = await api_football_get("/fixtures", params=params)
-            for item in data.get("response", []):
+            resp = data.get("response", [])
+
+            logging.info(
+                f"Live fixtures {cfg['name']} | season={cfg['season']} | encontrados={len(resp)}"
+            )
+
+            for item in resp:
                 fixture = item.get("fixture", {})
                 teams = item.get("teams", {})
                 goals = item.get("goals", {})
@@ -509,7 +509,7 @@ async def get_live_matches():
 
                 live_matches.append({
                     "fixture_id": fixture.get("id"),
-                    "league_name": league_name,
+                    "league_name": cfg["name"],
                     "home": teams.get("home", {}).get("name"),
                     "away": teams.get("away", {}).get("name"),
                     "home_goals": goals.get("home", 0) or 0,
@@ -519,7 +519,7 @@ async def get_live_matches():
                     "score_raw": score,
                 })
         except Exception as e:
-            logging.warning(f"No se pudieron obtener partidos en vivo de {league_name}: {e}")
+            logging.warning(f"No se pudieron obtener partidos en vivo de {cfg['name']}: {e}")
 
     return live_matches
 
@@ -532,7 +532,7 @@ async def get_fixture_events(fixture_id: int):
         return []
 
 # =============================================================================
-# LÓGICA DE SEÑALES EN VIVO
+# SEÑALES EN VIVO
 # =============================================================================
 
 async def analyze_live_match(match):
@@ -548,19 +548,15 @@ async def analyze_live_match(match):
 
     signals = []
 
-    # 0-0 tardío
     if hg == 0 and ag == 0 and minute >= LIVE_DRAW_ONLY_MINUTE:
         signals.append("late_draw_0_0")
 
-    # empate tardío en general
     if hg == ag and minute >= LIVE_DRAW_ONLY_MINUTE:
         signals.append("late_draw_any")
 
-    # diferencia de un gol avanzada
     if abs(hg - ag) == 1 and minute >= LIVE_MINUTE_THRESHOLD:
         signals.append("one_goal_margin_late")
 
-    # revisar roja
     events = await get_fixture_events(fixture_id)
     red_found = False
     for ev in events:
@@ -569,6 +565,7 @@ async def analyze_live_match(match):
         if "red card" in detail or "red card" in typ or "tarjeta roja" in detail:
             red_found = True
             break
+
     if red_found and minute >= LIVE_MINUTE_THRESHOLD:
         signals.append("red_card_pressure")
 
@@ -583,7 +580,6 @@ def format_live_signal(match, reason_code):
     league = match["league_name"]
 
     reason_text = translate_reason(reason_code, home, away, hg, ag)
-
     vip = "💎 SEÑAL VIP EN VIVO" if reason_code in ["red_card_pressure", "late_draw_0_0"] else "🔴 SEÑAL EN VIVO"
 
     return (
@@ -613,8 +609,6 @@ async def process_prematch():
         except Exception as e:
             logging.warning(f"Error obteniendo odds de {sport_key}: {e}")
 
-    sent_messages = []
-
     now_dt = now_local()
     limit_dt = now_dt + timedelta(hours=PRE_MATCH_WINDOW_HOURS)
 
@@ -641,7 +635,7 @@ async def process_prematch():
         text = format_prematch_signal(match, analysis)
         await safe_send_message(bot, CHAT_ID, text)
         sent_prematch_signals.add(dedupe_key)
-        sent_messages.append(text)
+        save_state()
 
     return all_matches
 
@@ -660,6 +654,7 @@ async def process_parlay(all_matches):
     text = format_parlay_signal(parlay)
     await safe_send_message(bot, CHAT_ID, text)
     sent_parley_signals.add(parlay_key)
+    save_state()
 
 async def process_live():
     if not ENABLE_LIVE:
@@ -678,6 +673,8 @@ async def process_live():
                 text = format_live_signal(match, reason_code)
                 await safe_send_message(bot, CHAT_ID, text)
                 sent_live_signals.add(dedupe_key)
+                save_state()
+
         except Exception as e:
             logging.warning(f"Error analizando partido en vivo {match.get('fixture_id')}: {e}")
 
@@ -694,6 +691,7 @@ async def send_daily_fixture_status(fixtures):
                 "📭 Hoy no encontré partidos de tus ligas configuradas. El bot dormirá hasta mañana para ahorrar créditos."
             )
             last_no_fixtures_alert_date = today_str
+            save_state()
         return
 
     if last_fixtures_found_alert_date != today_str:
@@ -706,19 +704,18 @@ async def send_daily_fixture_status(fixtures):
             f"📅 Encontré partidos para hoy en {leagues_text}. El bot queda atento para mandarte señales y parleys."
         )
         last_fixtures_found_alert_date = today_str
+        save_state()
 
 async def run_cycle():
     now_dt = now_local()
     current_hour = now_dt.hour
 
-    # Antes de las 7 AM -> dormir
     if current_hour < ACTIVE_START_HOUR:
-        logging.info("Fuera de horario. Esperando a las 7 AM.")
+        logging.info("Fuera de horario. Esperando a la siguiente ventana activa.")
         return True
 
-    # 10 PM o más -> dormir hasta mañana
     if current_hour >= ACTIVE_END_HOUR:
-        logging.info("Después de las 10 PM. Durmiendo hasta mañana.")
+        logging.info("Después del horario activo. Durmiendo hasta mañana.")
         return True
 
     fixtures = await get_today_fixtures()
@@ -756,7 +753,7 @@ def seconds_until_next_active_window():
 
 async def main():
     load_state()
-    logging.info("Iniciando ciclo V13.3 PRO...")
+    logging.info("Iniciando ciclo V13.3 PRO FIX SEASON...")
 
     while True:
         try:
