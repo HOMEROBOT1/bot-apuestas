@@ -1,20 +1,16 @@
-# ==============================
-# V13.4 PRO - MULTI MERCADO
-# ==============================
-
 import asyncio
 import logging
 import os
-import re
-from datetime import datetime, timedelta
+from datetime import datetime
 from statistics import mean
 from zoneinfo import ZoneInfo
 
 import httpx
 from telegram import Bot
-from telegram.error import TelegramError
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+# ==============================
+# CONFIG
+# ==============================
 
 BOT_TOKEN = "8713741185:AAFqvoZ0Ji3xWw2FsA8BuMslfCGhQ0tMzCQ"
 CHAT_ID = "1983622390"
@@ -23,32 +19,16 @@ API_FOOTBALL_KEY = "c455630d0023ef208f93dd0567164905"
 
 LOCAL_TZ = ZoneInfo("America/Mexico_City")
 
-ODDS_MARKETS = "h2h,totals,btts"
-MIN_VALUE_EDGE = 0.06
+MARKETS = "h2h,totals,btts"
 
 ACTIVE_START = 7
 ACTIVE_END = 22
 
+MIN_EDGE = 0.05
+
 bot = Bot(token=BOT_TOKEN)
 
-# ==============================
-# LIGAS + SEASON
-# ==============================
-
-LEAGUES = {
-    262: {"name": "Liga MX", "season": 2025},
-    39: {"name": "Premier League", "season": 2025},
-    2: {"name": "Champions League", "season": 2025},
-}
-
-SPORT_KEYS = [
-    "soccer_mexico_ligamx",
-    "soccer_epl",
-    "soccer_uefa_champs_league"
-]
-
-sent_signals = set()
-last_daily_alert = None
+sent = set()
 
 # ==============================
 # UTIL
@@ -57,31 +37,27 @@ last_daily_alert = None
 def now():
     return datetime.now(LOCAL_TZ)
 
-def to_local(x):
-    return datetime.fromisoformat(x.replace("Z","+00:00")).astimezone(LOCAL_TZ)
-
 def safe_float(x):
     try: return float(x)
     except: return None
 
-def prob(o): return 1/o if o else None
-def odds(p): return 1/p if p else None
+def prob(o):
+    return 1/o if o else None
 
-async def send(msg):
-    try:
-        await bot.send_message(chat_id=CHAT_ID, text=msg)
-    except Exception as e:
-        logging.error(e)
+def odds(p):
+    return 1/p if p else None
 
 # ==============================
-# ODDS ANALYSIS MULTI
+# ANALISIS PRO
 # ==============================
 
-def analyze(match):
+def analyze_match(match):
+
     home = match["home_team"]
     away = match["away_team"]
 
-    candidates = []
+    probs = []
+    best = []
 
     for bm in match.get("bookmakers", []):
         for m in bm.get("markets", []):
@@ -89,35 +65,27 @@ def analyze(match):
             # H2H
             if m["key"] == "h2h":
                 for o in m["outcomes"]:
-                    name = o["name"]
                     price = safe_float(o["price"])
                     if not price: continue
 
-                    label = None
-                    if name.lower() == home.lower():
-                        label = f"Gana {home}"
-                    elif name.lower() == away.lower():
-                        label = f"Gana {away}"
-                    elif name.lower() in ["draw","empate"]:
-                        label = "Empate"
+                    p = prob(price)
+                    if not p: continue
 
-                    if label:
-                        candidates.append(("h2h", label, price))
+                    probs.append((o["name"], p, price, "h2h"))
 
             # TOTALS
             if m["key"] == "totals":
                 for o in m["outcomes"]:
-                    side = o["name"].lower()
-                    pt = safe_float(o["point"])
+                    pt = safe_float(o.get("point"))
                     price = safe_float(o["price"])
-                    if not price or pt is None: continue
+                    name = o["name"].lower()
 
-                    if pt == 1.5 and side == "over":
-                        candidates.append(("totals", "Over 1.5 goles", price))
-                    if pt == 2.5 and side == "over":
-                        candidates.append(("totals", "Over 2.5 goles", price))
-                    if pt == 3.5 and side == "under":
-                        candidates.append(("totals", "Under 3.5 goles", price))
+                    if not price or pt is None:
+                        continue
+
+                    if (pt, name) in [(1.5,"over"), (2.5,"over"), (3.5,"under")]:
+                        p = prob(price)
+                        probs.append((f"{name} {pt}", p, price, "totals"))
 
             # BTTS
             if m["key"] == "btts":
@@ -125,114 +93,162 @@ def analyze(match):
                     if o["name"].lower() in ["yes","si","sí"]:
                         price = safe_float(o["price"])
                         if price:
-                            candidates.append(("btts","Ambos anotan: Sí", price))
+                            p = prob(price)
+                            probs.append(("btts yes", p, price, "btts"))
+
+    if not probs:
+        return None
+
+    # Promedio prob
+    avg_prob = mean([p[1] for p in probs])
+    fair_odds = odds(avg_prob)
+
+    candidates = []
+
+    for name, p, price, market in probs:
+
+        edge = (price / fair_odds) - 1
+
+        if edge < MIN_EDGE:
+            continue
+
+        candidates.append({
+            "pick": name,
+            "odds": round(price,2),
+            "edge": edge,
+            "market": market
+        })
 
     if not candidates:
         return None
 
-    best = max(candidates, key=lambda x: x[2])
-    return {
-        "market": best[0],
-        "pick": best[1],
-        "odds": round(best[2],2)
-    }
+    best = sorted(candidates, key=lambda x: x["edge"], reverse=True)[0]
+
+    # Stake automático
+    stake = 1
+    if best["edge"] > 0.10: stake = 2
+    if best["edge"] > 0.18: stake = 3
+
+    best["stake"] = stake
+
+    # Texto bonito
+    if best["market"] == "h2h":
+        if best["pick"].lower() == home.lower():
+            best["pick"] = f"Gana {home}"
+        elif best["pick"].lower() == away.lower():
+            best["pick"] = f"Gana {away}"
+        else:
+            best["pick"] = "Empate"
+
+    if best["market"] == "totals":
+        if "over" in best["pick"]:
+            best["pick"] = f"Over {best['pick'].split()[1]} goles"
+        else:
+            best["pick"] = f"Under {best['pick'].split()[1]} goles"
+
+    if best["market"] == "btts":
+        best["pick"] = "Ambos anotan: Sí"
+
+    return best
 
 # ==============================
-# API CALLS
+# API
 # ==============================
 
 async def get_odds():
     all = []
     async with httpx.AsyncClient() as client:
-        for s in SPORT_KEYS:
-            url = f"https://api.the-odds-api.com/v4/sports/{s}/odds"
-            r = await client.get(url, params={
-                "apiKey": ODDS_API_KEY,
-                "regions":"uk",
-                "markets":ODDS_MARKETS
-            })
-            data = r.json()
-            all.extend(data)
-    return all
-
-async def get_fixtures():
-    today = now().strftime("%Y-%m-%d")
-    all = []
-
-    async with httpx.AsyncClient() as client:
-        for lid,cfg in LEAGUES.items():
+        for sport in ["soccer_mexico_ligamx","soccer_epl","soccer_uefa_champs_league"]:
             r = await client.get(
-                "https://v3.football.api-sports.io/fixtures",
-                headers={"x-apisports-key": API_FOOTBALL_KEY},
+                f"https://api.the-odds-api.com/v4/sports/{sport}/odds",
                 params={
-                    "league": lid,
-                    "season": cfg["season"],
-                    "date": today,
-                    "timezone":"America/Mexico_City"
+                    "apiKey": ODDS_API_KEY,
+                    "regions":"uk",
+                    "markets":MARKETS
                 }
             )
-            data = r.json()["response"]
-
-            logging.info(f"{cfg['name']} -> {len(data)} partidos")
-
-            for f in data:
-                all.append(f)
-
-    logging.info(f"TOTAL HOY: {len(all)}")
+            all.extend(r.json())
     return all
 
 # ==============================
-# CICLO
+# PARLAY PRO
+# ==============================
+
+def build_parlay(picks):
+
+    picks = sorted(picks, key=lambda x: x["edge"], reverse=True)
+
+    selected = []
+    total_odds = 1
+
+    for p in picks:
+        if len(selected) >= 3:
+            break
+
+        if total_odds * p["odds"] <= 4.5:
+            selected.append(p)
+            total_odds *= p["odds"]
+
+    if len(selected) < 2:
+        return None
+
+    return selected, round(total_odds,2)
+
+# ==============================
+# LOOP
 # ==============================
 
 async def run():
 
-    global last_daily_alert
-
-    hour = now().hour
-
-    if hour < ACTIVE_START or hour >= ACTIVE_END:
+    if now().hour < ACTIVE_START or now().hour >= ACTIVE_END:
         return True
-
-    fixtures = await get_fixtures()
-
-    today = now().strftime("%Y-%m-%d")
-
-    if not fixtures:
-        if last_daily_alert != today:
-            await send("📭 Hoy no hay partidos en tus ligas.")
-            last_daily_alert = today
-        return True
-    else:
-        if last_daily_alert != today:
-            await send("📅 Hay partidos hoy. Bot activo.")
-            last_daily_alert = today
 
     odds = await get_odds()
 
+    picks = []
+
     for m in odds:
-        analysis = analyze(m)
-        if not analysis:
+
+        a = analyze_match(m)
+        if not a:
             continue
 
-        key = f"{m['home_team']}|{analysis['pick']}"
-        if key in sent_signals:
+        key = f"{m['home_team']}|{a['pick']}"
+        if key in sent:
             continue
 
         msg = (
             f"📊 BETTING SIGNAL\n\n"
             f"{m['home_team']} vs {m['away_team']}\n"
-            f"🎯 {analysis['pick']}\n"
-            f"💰 Cuota: {analysis['odds']}"
+            f"🎯 {a['pick']}\n"
+            f"💰 Cuota: {a['odds']}\n"
+            f"🔥 Edge: {round(a['edge']*100,1)}%\n"
+            f"📈 Stake: {a['stake']}/10"
         )
 
-        await send(msg)
-        sent_signals.add(key)
+        await bot.send_message(chat_id=CHAT_ID, text=msg)
+
+        sent.add(key)
+        picks.append(a)
+
+    # PARLAY
+    parlay = build_parlay(picks)
+    if parlay:
+        legs, total = parlay
+
+        txt = "🔥 PARLAY PRO\n\n"
+
+        for i,l in enumerate(legs,1):
+            txt += f"{i}. {l['pick']} @ {l['odds']}\n"
+
+        txt += f"\n💰 Total: {total}"
+
+        await bot.send_message(chat_id=CHAT_ID, text=txt)
 
     return False
 
 # ==============================
-# LOOP
+# MAIN
 # ==============================
 
 async def main():
